@@ -1,0 +1,39 @@
+services:
+  bot:
+    build: .
+    image: discord-transcriber:latest
+    container_name: discord-transcriber
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./recordings:/app/recordings
+      - ./config.yaml:/app/config.yaml:ro
+      - whisper-models:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Uncomment if you set summarizer.backend: ollama in config.yaml.
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: discord-transcriber-ollama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+
+volumes:
+  whisper-models:
+  # ollama-data:
