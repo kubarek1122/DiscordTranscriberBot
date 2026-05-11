@@ -12,6 +12,7 @@ from src.pipeline import run_pipeline
 from src.recording import RecordingSession, ensure_ffmpeg, finalize_audio
 from src.session import SessionState, is_heartbeat_stale, scan_unfinished
 from src.transcribe import Transcriber
+from src.messages import SKRYBA
 
 logging.basicConfig(
     level=logging.INFO,
@@ -95,7 +96,7 @@ class TranscriberBot(discord.Bot):
 def make_bot(cfg: AppConfig) -> TranscriberBot:
     bot = TranscriberBot(cfg)
 
-    record = bot.create_group("record", "Sterowanie nagrywaniem rozmów")
+    skryba = bot.create_group("skryba", "Sterowanie nagrywaniem rozmów")
 
     async def _user_in_voice(ctx: discord.ApplicationContext) -> Optional[discord.VoiceChannel]:
         if not isinstance(ctx.author, discord.Member):
@@ -104,7 +105,7 @@ def make_bot(cfg: AppConfig) -> TranscriberBot:
             return None
         return ctx.author.voice.channel  # type: ignore[return-value]
 
-    @record.command(name="start", description="Dołącza do twojego kanału głosowego i zaczyna nagrywać.")
+    @skryba.command(name="start", description="Dołącza do twojego kanału głosowego i zaczyna nagrywać.")
     async def start_cmd(ctx: discord.ApplicationContext) -> None:
         await ctx.defer(ephemeral=True)
         guild = ctx.guild
@@ -160,7 +161,7 @@ def make_bot(cfg: AppConfig) -> TranscriberBot:
             ephemeral=True,
         )
 
-    @record.command(name="stop", description="Kończy nagrywanie i publikuje podsumowanie.")
+    @skryba.command(name="stop", description="Kończy nagrywanie i publikuje podsumowanie.")
     async def stop_cmd(ctx: discord.ApplicationContext) -> None:
         await ctx.defer()
         guild = ctx.guild
@@ -199,7 +200,7 @@ def make_bot(cfg: AppConfig) -> TranscriberBot:
             except Exception:
                 pass
 
-    @record.command(name="status", description="Pokazuje stan nagrywania.")
+    @skryba.command(name="status", description="Pokazuje stan nagrywania.")
     async def status_cmd(ctx: discord.ApplicationContext) -> None:
         guild = ctx.guild
         if guild is None:
@@ -219,6 +220,15 @@ def make_bot(cfg: AppConfig) -> TranscriberBot:
             f"(czas: {h:02d}:{m:02d}:{s:02d}). Mówcy: {members}.",
             ephemeral=True,
         )
+
+    @skryba.command(name="jaktojestbycskryba", description="Jak to jest być skrybą, dobrze?")
+    async def jaktojestbycskryba_cmd(ctx: discord.ApplicationContext) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.respond("Komenda działa tylko na serwerze.", ephemeral=True)
+            return
+        await ctx.respond(SKRYBA)
+
 
     @bot.event
     async def on_voice_state_update(  # noqa: ARG001

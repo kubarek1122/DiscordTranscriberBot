@@ -31,6 +31,9 @@ Zasady ogólne:
 i pozostałe sekcje wypełnij wpisem „_(brak)_".
 - NIE dodawaj żadnych innych nagłówków ani sekcji poza wymienionymi powyżej.
 - NIE dołączaj wstępu typu „Oto podsumowanie:" — zacznij od razu od nagłówka.
+- Jeżeli zobaczysz w transkrypcie słowa "skrybo zapisz" lub "skrybo zapamiętaj" oznaczają one,\
+ że fragment poprzedzający lub następujący zawiera informacje warte uwagi. W takiej sytuacji \
+ w zależności od kontekstu zaznacz w podsumowaniu oznaczony fragment
 """
 
 USER_TEMPLATE = """\
