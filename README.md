@@ -16,9 +16,10 @@ Self-hosted Discord bot that joins voice channels, transcribes Polish discussion
 
 ## Slash commands
 
-- `/record start` — bot joins your voice channel and starts recording.
-- `/record stop` — finalize, transcribe, summarize, post the summary.
-- `/record status` — show current state.
+- `/skryba start` — bot joins your voice channel and starts recording.
+- `/skryba stop` — finalize, transcribe, summarize, post the summary.
+- `/skryba status` — show current state.
+- `/skryba jaktojestbycskryba` — show quote form Asterix & Obelix
 
 ## Artifacts
 
