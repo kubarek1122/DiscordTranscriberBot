@@ -115,7 +115,7 @@ def make_bot(cfg: AppConfig) -> TranscriberBot:
 
         if guild.id in bot.sessions:
             await ctx.followup.send(
-                "Już nagrywam na tym serwerze. Użyj `/record stop`, aby zakończyć.",
+                "Już nagrywam na tym serwerze. Użyj `/skryba stop`, aby zakończyć.",
                 ephemeral=True,
             )
             return
@@ -157,7 +157,7 @@ def make_bot(cfg: AppConfig) -> TranscriberBot:
         bot.sessions[guild.id] = session
         await ctx.followup.send(
             f"Nagrywam na kanale **{vc_channel.name}**. "
-            f"Zatrzymaj komendą `/record stop`.",
+            f"Zatrzymaj komendą `/skryba stop`.",
             ephemeral=True,
         )
 

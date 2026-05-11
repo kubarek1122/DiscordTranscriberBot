@@ -1,4 +1,4 @@
-py-cord[voice]==2.6.1
+py-cord[voice]>=2.7.0
 faster-whisper>=1.0.3
 ctranslate2>=4.5.0
 pydantic>=2.6
