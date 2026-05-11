@@ -1,4 +1,9 @@
-py-cord[voice]>=2.7.0
+discord.py[voice]>=2.6.0
+# voice_recv >= 0.6 is needed for DAVE (voice gateway v8 E2EE) — without it
+# the opus decoder receives still-encrypted bytes and dies with "corrupted
+# stream". If the PyPI build still lags Discord, swap for the git main:
+#   discord-ext-voice-recv @ git+https://github.com/imayhaveborkedit/discord-ext-voice-recv.git
+discord-ext-voice-recv>=0.6.0
 faster-whisper>=1.0.3
 ctranslate2>=4.5.0
 pydantic>=2.6

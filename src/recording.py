@@ -7,10 +7,10 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Optional
 
 import discord
-from discord.sinks import Sink
+from discord.ext import voice_recv
 
 from config import AppConfig
 from src.session import SessionState, make_session_dir
@@ -18,36 +18,66 @@ from src.session import SessionState, make_session_dir
 log = logging.getLogger(__name__)
 
 
-class ChunkedPCMSink(Sink):
-    """Custom sink that streams per-user raw PCM directly to disk.
+class ChunkedPCMSink(voice_recv.AudioSink):
+    """voice_recv sink that streams per-user raw PCM straight to disk.
 
-    Discord delivers 48 kHz stereo signed-16 PCM frames via Sink.write(data, user).
-    We append each frame to <audio_dir>/<user_id>.pcm. fsync_all() can be called
-    periodically by a heartbeat to harden against power loss.
+    discord-ext-voice-recv delivers 48 kHz stereo signed-16 PCM frames via
+    write(user, data). We append each frame to <audio_dir>/<user_id>.pcm.
+    fsync_all() is called periodically by a heartbeat to harden against power
+    loss.
     """
 
     def __init__(self, audio_dir: Path) -> None:
         super().__init__()
         self.audio_dir = audio_dir
         self._files: dict[int, BinaryIO] = {}
+        self._bytes_per_user: dict[int, int] = {}
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.observed_user_ids: set[int] = set()
+        self._total_frames = 0
+        self._frames_no_user = 0
+        self._frames_no_pcm = 0
 
-    def write(self, data, user) -> None:  # py-cord calls this for each PCM frame
-        f = self._files.get(user)
+    def wants_opus(self) -> bool:
+        return False  # we want decoded PCM
+
+    def write(
+        self,
+        user: Optional[discord.Member],
+        data: voice_recv.VoiceData,
+    ) -> None:
+        self._total_frames += 1
+        if user is None:
+            self._frames_no_user += 1
+            return
+        pcm = getattr(data, "pcm", None)
+        if not pcm:
+            self._frames_no_pcm += 1
+            if self._frames_no_pcm == 1:
+                log.warning(
+                    "sink: first frame for user %s has no pcm "
+                    "(opus decoder probably not loaded)",
+                    user,
+                )
+            return
+        uid = user.id
+        f = self._files.get(uid)
         if f is None:
-            path = self.audio_dir / f"{user}.pcm"
+            path = self.audio_dir / f"{uid}.pcm"
             f = open(path, "ab")
-            self._files[user] = f
-            self.observed_user_ids.add(int(user))
-        f.write(data.pcm)
+            self._files[uid] = f
+            self.observed_user_ids.add(uid)
+            self._bytes_per_user[uid] = 0
+            log.info("sink: first frame from %s (%s bytes pcm)", user, len(pcm))
+        f.write(pcm)
+        self._bytes_per_user[uid] = self._bytes_per_user.get(uid, 0) + len(pcm)
 
     def fsync_all(self) -> None:
         for f in self._files.values():
             try:
                 f.flush()
                 os.fsync(f.fileno())
-            except Exception:  # best-effort
+            except Exception:
                 pass
 
     def cleanup(self) -> None:
@@ -97,7 +127,7 @@ def finalize_audio(session_dir: Path) -> None:
 
 
 def cleanup_audio_files(session_dir: Path) -> None:
-    """Delete per-user .pcm and .wav files. Called after success when keep_audio=false."""
+    """Delete per-user .pcm and .wav files after successful upload."""
     audio_dir = session_dir / "audio"
     if not audio_dir.exists():
         return
@@ -111,7 +141,7 @@ def cleanup_audio_files(session_dir: Path) -> None:
 
 @dataclass
 class RecordingSession:
-    voice_client: discord.VoiceClient
+    voice_client: voice_recv.VoiceRecvClient
     session_dir: Path
     state: SessionState
     cfg: AppConfig
@@ -123,7 +153,7 @@ class RecordingSession:
     def create(
         cls,
         *,
-        voice_client: discord.VoiceClient,
+        voice_client: voice_recv.VoiceRecvClient,
         text_channel_id: int,
         cfg: AppConfig,
     ) -> "RecordingSession":
@@ -134,7 +164,6 @@ class RecordingSession:
             text_channel_id=text_channel_id,
         )
         state.summarizer_backend = cfg.summarizer.backend
-        # Prime members from the voice channel roster.
         for m in voice_client.channel.members:
             if not m.bot:
                 state.members[str(m.id)] = m.display_name
@@ -153,10 +182,13 @@ class RecordingSession:
         )
 
     def start(self) -> None:
-        async def _on_done(sink: Sink, *_args):  # noqa: ARG001
-            log.info("sink finished cleanup for session %s", self.session_dir.name)
+        def _after(exc: Exception | None) -> None:
+            if exc is not None:
+                log.warning("listener stopped with error: %r", exc)
+            else:
+                log.info("listener stopped cleanly for %s", self.session_dir.name)
 
-        self.voice_client.start_recording(self.sink, _on_done)
+        self.voice_client.listen(self.sink, after=_after)
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         log.info("recording started in %s", self.session_dir)
 
@@ -165,7 +197,6 @@ class RecordingSession:
             while not self._stopped:
                 await asyncio.sleep(self.cfg.recording.heartbeat_interval_s)
                 self.sink.fsync_all()
-                # Refresh members for anyone who joined mid-call
                 guild = self.voice_client.guild
                 for uid in list(self.sink.observed_user_ids):
                     key = str(uid)
@@ -188,19 +219,32 @@ class RecordingSession:
                 await self._heartbeat_task
             except asyncio.CancelledError:
                 pass
+
         try:
-            if self.voice_client.recording:
-                self.voice_client.stop_recording()
+            if self.voice_client.is_listening():
+                self.voice_client.stop_listening()
         except Exception as e:
-            log.warning("stop_recording raised: %s", e)
+            log.warning("stop_listening raised: %s", e)
+
+        # voice_recv's AudioSink.cleanup() is called by stop_listening, but
+        # we call again to be safe (it's idempotent).
         self.sink.cleanup()
+
+        log.info(
+            "sink stats: total_frames=%d frames_no_user=%d frames_no_pcm=%d "
+            "users_with_audio=%d bytes_per_user=%s",
+            self.sink._total_frames,
+            self.sink._frames_no_user,
+            self.sink._frames_no_pcm,
+            len(self.sink._bytes_per_user),
+            self.sink._bytes_per_user,
+        )
 
         try:
             await self.voice_client.disconnect(force=False)
         except Exception as e:
             log.warning("voice disconnect raised: %s", e)
 
-        # Final member refresh
         guild = self.voice_client.guild
         for uid in list(self.sink.observed_user_ids):
             key = str(uid)
