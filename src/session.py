@@ -10,7 +10,12 @@ from pydantic import BaseModel, Field
 
 from src.artifacts import write_atomic
 
-Stage = Literal["recording", "recorded", "transcribed", "summarized", "posted"]
+Stage = Literal[
+    "recording", "recorded", "transcribed", "summarized", "posted", "failed"
+]
+# Linear forward progression. `failed` is a terminal branch that may be
+# entered from any non-terminal stage and is intentionally not part of the
+# order — use TERMINAL_STAGES / advance() to handle it.
 STAGE_ORDER: tuple[Stage, ...] = (
     "recording",
     "recorded",
@@ -18,6 +23,7 @@ STAGE_ORDER: tuple[Stage, ...] = (
     "summarized",
     "posted",
 )
+TERMINAL_STAGES: frozenset[Stage] = frozenset({"posted", "failed"})
 
 
 class SessionState(BaseModel):
@@ -31,6 +37,10 @@ class SessionState(BaseModel):
     posted_message_id: int | None = None
     summarizer_backend: str | None = None
     error: str | None = None
+    # Cumulative count of top-level pipeline invocations that raised. The
+    # pipeline advances to `failed` once this hits `cfg.reliability.max_pipeline_retries`.
+    retries: int = 0
+    last_error: str | None = None
 
     @classmethod
     def new(
@@ -56,9 +66,28 @@ class SessionState(BaseModel):
         write_atomic(session_dir / "session.json", self.model_dump_json(indent=2))
 
     def advance(self, session_dir: Path, stage: Stage) -> None:
+        # `failed` is a terminal branch that may be entered from anywhere
+        # except after `posted`. Once at `failed`, we stay there.
+        if stage == "failed":
+            if self.stage == "posted":
+                return
+            self.stage = "failed"
+            self.save(session_dir)
+            return
+        if self.stage == "failed":
+            return
         if STAGE_ORDER.index(stage) < STAGE_ORDER.index(self.stage):
             return
         self.stage = stage
+        self.save(session_dir)
+
+    def record_failure(self, session_dir: Path, error: str) -> None:
+        """Bump the retry counter and persist a truncated error string.
+        Distinct from `advance("failed")` — this captures a single attempt's
+        failure; the pipeline decides whether the cumulative count warrants
+        marking the session terminally failed."""
+        self.retries += 1
+        self.last_error = error[:500]
         self.save(session_dir)
 
     def heartbeat(self, session_dir: Path) -> None:
@@ -98,13 +127,30 @@ def most_recent_unfinished(root: Path, guild_id: int) -> Path | None:
             state = SessionState.load(session_dir)
         except Exception:
             continue
-        if state.stage != "posted":
+        if state.stage not in TERMINAL_STAGES:
+            return session_dir
+    return None
+
+
+def latest_for_guild(root: Path, guild_id: int) -> Path | None:
+    """Newest session directory for `guild_id` regardless of stage. Used by
+    UX commands that want to report on a session even if it's terminal
+    (e.g. `/skryba status` showing the most recent `failed`)."""
+    guild_dir = root / str(guild_id)
+    if not guild_dir.exists():
+        return None
+    for session_dir in sorted(
+        (p for p in guild_dir.iterdir() if p.is_dir()),
+        key=lambda p: p.name,
+        reverse=True,
+    ):
+        if (session_dir / "session.json").exists():
             return session_dir
     return None
 
 
 def scan_unfinished(root: Path) -> list[Path]:
-    """Return session dirs whose session.json has stage != 'posted'."""
+    """Return session dirs whose session.json has a non-terminal stage."""
     if not root.exists():
         return []
     out: list[Path] = []
@@ -119,7 +165,7 @@ def scan_unfinished(root: Path) -> list[Path]:
                 state = SessionState.load(session_dir)
             except Exception:
                 continue
-            if state.stage != "posted":
+            if state.stage not in TERMINAL_STAGES:
                 out.append(session_dir)
     return out
 

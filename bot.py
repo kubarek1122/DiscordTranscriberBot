@@ -13,12 +13,13 @@ from discord.ext import commands
 
 from config import AppConfig, load_config
 from src.logging_util import session_log
-from src.messages import SKRYBA
+from src.messages import RECORDING_CUT_SHORT, SKRYBA
 from src.pipeline import notify_pipeline_failure, run_pipeline
 from src.recording import RecordingSession, ensure_ffmpeg, finalize_audio
 from src.session import (
     SessionState,
     is_heartbeat_stale,
+    latest_for_guild,
     most_recent_unfinished,
     scan_unfinished,
 )
@@ -88,6 +89,53 @@ class TranscriberBot(commands.Bot):
         except Exception:
             log.exception("recovery scan failed")
 
+    async def _auto_stop_session(self, guild_id: int, reason: str) -> None:
+        """Triggered by the sidecar when a recording can't continue (kicked
+        from VC, voice gateway gave up). Stops the session, posts a Polish
+        notice to the original text channel, and runs the pipeline on the
+        captured PCM. Idempotent — pops the session under a lock-free check
+        so a concurrent `/skryba stop` can't double-run."""
+        session = self.sessions.pop(guild_id, None)
+        if session is None:
+            return
+        log.warning(
+            "auto-stop: guild=%s reason=%s — recording cut short by sidecar",
+            guild_id, reason,
+        )
+        session_dir = session.session_dir
+        text_channel_id = session.text_channel_id
+        try:
+            await session.stop()
+        except Exception:
+            log.exception("auto-stop: session.stop() raised")
+
+        # Tell the user — best-effort, don't let a failed notice block the pipeline.
+        try:
+            channel = self.get_channel(text_channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(text_channel_id)
+            await channel.send(RECORDING_CUT_SHORT.format(reason=reason))
+        except Exception:
+            log.exception("auto-stop: could not post cut-short notice")
+
+        try:
+            await run_pipeline(
+                session_dir=session_dir,
+                cfg=self.cfg,
+                transcriber=self.transcriber,
+                bot=self,
+            )
+        except Exception as e:
+            log.exception("auto-stop: pipeline failed for %s", session_dir)
+            await notify_pipeline_failure(
+                bot=self,
+                text_channel_id=text_channel_id,
+                session_dir=session_dir,
+                error=e,
+            )
+        finally:
+            session.release_log()
+
     async def close(self) -> None:  # type: ignore[override]
         """Graceful shutdown. Stops every active session so the recorder
         sidecar flushes PCM to disk and the on-disk state advances to
@@ -143,15 +191,41 @@ class TranscriberBot(commands.Bot):
                     )
                     continue
 
+            timeout_s = self.cfg.reliability.recovery_per_session_timeout_s
             try:
                 with session_log(session_dir):
-                    await run_pipeline(
-                        session_dir=session_dir,
-                        cfg=self.cfg,
-                        transcriber=self.transcriber,
-                        bot=self,
+                    await asyncio.wait_for(
+                        run_pipeline(
+                            session_dir=session_dir,
+                            cfg=self.cfg,
+                            transcriber=self.transcriber,
+                            bot=self,
+                        ),
+                        timeout=timeout_s,
                     )
                 log.info("recovery: completed %s", session_dir)
+            except asyncio.TimeoutError as e:
+                # Treat the timeout itself as a failed attempt so the retry
+                # budget eventually marks chronically-stuck sessions failed.
+                log.error(
+                    "recovery: pipeline timed out after %ds for %s",
+                    timeout_s, session_dir,
+                )
+                try:
+                    cur = SessionState.load(session_dir)
+                    cur.record_failure(session_dir, f"recovery timeout after {timeout_s}s")
+                    if cur.retries >= self.cfg.reliability.max_pipeline_retries:
+                        cur.advance(session_dir, "failed")
+                except Exception:
+                    log.exception(
+                        "recovery: could not record timeout failure on %s", session_dir
+                    )
+                await notify_pipeline_failure(
+                    bot=self,
+                    text_channel_id=state.text_channel_id,
+                    session_dir=session_dir,
+                    error=e,
+                )
             except Exception as e:
                 log.exception("recovery: pipeline failed for %s", session_dir)
                 await notify_pipeline_failure(
@@ -211,10 +285,17 @@ class SkrybaGroup(app_commands.Group):
             )
             return
 
+        # The sidecar uses this callback to surface kicks / voice-gateway
+        # giveups; the bot then auto-stops the session and runs the pipeline
+        # on whatever PCM was captured before the cut.
+        async def _on_hard_failure(reason: str) -> None:
+            await self.bot._auto_stop_session(guild.id, reason)
+
         session = RecordingSession.create(
             voice_channel=vc_channel,
             text_channel_id=interaction.channel_id,
             cfg=self.bot.cfg,
+            on_hard_failure=_on_hard_failure,
         )
         try:
             await session.start()
@@ -252,10 +333,31 @@ class SkrybaGroup(app_commands.Group):
         text_channel_id = session.text_channel_id
         await session.stop()
 
-        await interaction.followup.send(
-            "Zakończono nagrywanie. Trwa transkrypcja i podsumowywanie...",
+        progress_msg = await interaction.followup.send(
+            "Zakończono nagrywanie. Przygotowuję transkrypcję…",
             ephemeral=True,
+            wait=True,
         )
+
+        # Polish status strings shown in the ephemeral while the pipeline runs.
+        # Keys correspond to the *target* stage the pipeline is entering.
+        _STAGE_LABELS = {
+            "transcribed": "Transkrybuję mowę przez Whisper…",
+            "summarized": "Podsumowuję rozmowę…",
+            "posted": "Publikuję podsumowanie w kanale…",
+        }
+
+        async def _on_stage(stage: str) -> None:
+            label = _STAGE_LABELS.get(stage)
+            if label is None or progress_msg is None:
+                return
+            try:
+                await progress_msg.edit(content=label)
+            except Exception:
+                # Editing the ephemeral is best-effort UX — pipeline must
+                # not fail just because Discord rate-limited or the
+                # interaction expired.
+                pass
 
         try:
             await run_pipeline(
@@ -263,7 +365,13 @@ class SkrybaGroup(app_commands.Group):
                 cfg=self.bot.cfg,
                 transcriber=self.bot.transcriber,
                 bot=self.bot,
+                on_stage=_on_stage,
             )
+            if progress_msg is not None:
+                try:
+                    await progress_msg.edit(content="Gotowe! Podsumowanie opublikowane.")
+                except Exception:
+                    pass
         except Exception as e:
             log.exception("pipeline failed for session %s", session_dir)
             # Tell both the invoker (ephemeral, may not be seen) and the
@@ -298,19 +406,55 @@ class SkrybaGroup(app_commands.Group):
             )
             return
         session = self.bot.sessions.get(guild.id)
-        if session is None:
+        if session is not None:
+            started = datetime.fromisoformat(session.state.started_at)
+            elapsed_s = int((datetime.now(timezone.utc) - started).total_seconds())
+            m, s = divmod(elapsed_s, 60)
+            h, m = divmod(m, 60)
+            members = ", ".join(session.state.members.values()) or "(brak)"
             await interaction.response.send_message(
-                "Brak aktywnego nagrania.", ephemeral=True
+                f"Nagrywam od {started.isoformat(timespec='seconds')} "
+                f"(czas: {h:02d}:{m:02d}:{s:02d}). Mówcy: {members}.",
+                ephemeral=True,
             )
             return
-        started = datetime.fromisoformat(session.state.started_at)
-        elapsed_s = int((datetime.now(timezone.utc) - started).total_seconds())
-        m, s = divmod(elapsed_s, 60)
-        h, m = divmod(m, 60)
-        members = ", ".join(session.state.members.values()) or "(brak)"
+
+        # Nothing live — fall back to disk so the user can see whether a
+        # session is still being processed by the pipeline (in-memory state
+        # is cleared by `stop()` before run_pipeline starts).
+        latest = latest_for_guild(self.bot.cfg.recording.output_dir, guild.id)
+        if latest is None:
+            await interaction.response.send_message(
+                "Brak aktywnego nagrania i żadnych zapisanych sesji.",
+                ephemeral=True,
+            )
+            return
+        try:
+            state = SessionState.load(latest)
+        except Exception:
+            await interaction.response.send_message(
+                f"Brak aktywnego nagrania. Ostatnia sesja: `{latest.name}` "
+                f"(nie udało się odczytać stanu).",
+                ephemeral=True,
+            )
+            return
+
+        stage_pl = {
+            "recording": "trwa nagrywanie (zombie? sprawdź heartbeat)",
+            "recorded": "zarchiwizowane audio, oczekuje na transkrypcję",
+            "transcribed": "transkrypcja gotowa, oczekuje na podsumowanie",
+            "summarized": "podsumowanie gotowe, oczekuje na publikację",
+            "posted": "opublikowane",
+            "failed": "porzucone / nieodzyskiwalne",
+        }.get(state.stage, state.stage)
+        extra = ""
+        if state.retries:
+            extra = f" (nieudane próby: {state.retries})"
+        if state.last_error and state.stage != "posted":
+            extra += f"\nOstatni błąd: `{state.last_error[:200]}`"
         await interaction.response.send_message(
-            f"Nagrywam od {started.isoformat(timespec='seconds')} "
-            f"(czas: {h:02d}:{m:02d}:{s:02d}). Mówcy: {members}.",
+            f"Brak aktywnego nagrania. Ostatnia sesja `{latest.name}`: "
+            f"**{stage_pl}**{extra}",
             ephemeral=True,
         )
 
@@ -337,6 +481,26 @@ class SkrybaGroup(app_commands.Group):
             self.bot.cfg.recording.output_dir, guild.id
         )
         if session_dir is None:
+            # If the user *just* hit the retry budget on a session, surface
+            # that fact instead of a blank "no unfinished session" message.
+            latest = latest_for_guild(
+                self.bot.cfg.recording.output_dir, guild.id
+            )
+            if latest is not None:
+                try:
+                    latest_state = SessionState.load(latest)
+                except Exception:
+                    latest_state = None
+                if latest_state is not None and latest_state.stage == "failed":
+                    err = latest_state.last_error or "(brak szczegółów)"
+                    await interaction.followup.send(
+                        f"Ostatnia sesja `{latest.name}` została oznaczona jako "
+                        f"`failed` po wyczerpaniu prób (`{err[:120]}`). "
+                        f"Użyj `/skryba porzuc`, żeby ją wyczyścić, "
+                        f"albo edytuj `session.json` ręcznie.",
+                        ephemeral=True,
+                    )
+                    return
             await interaction.followup.send(
                 "Nie znalazłem żadnej niedokończonej sesji na tym serwerze.",
                 ephemeral=True,
@@ -379,6 +543,48 @@ class SkrybaGroup(app_commands.Group):
                 session_dir=session_dir,
                 error=e,
             )
+
+    @app_commands.command(
+        name="porzuc",
+        description="Porzuca ostatnią niedokończoną sesję (oznacza ją jako failed).",
+    )
+    async def porzuc(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send(
+                "Komenda działa tylko na serwerze.", ephemeral=True
+            )
+            return
+        if guild.id in self.bot.sessions:
+            await interaction.followup.send(
+                "Trwa nagrywanie — najpierw zakończ przez `/skryba stop`.",
+                ephemeral=True,
+            )
+            return
+        session_dir = most_recent_unfinished(
+            self.bot.cfg.recording.output_dir, guild.id
+        )
+        if session_dir is None:
+            await interaction.followup.send(
+                "Nie ma niedokończonej sesji do porzucenia.", ephemeral=True
+            )
+            return
+        try:
+            state = SessionState.load(session_dir)
+            state.last_error = "abandoned by user"
+            state.advance(session_dir, "failed")
+        except Exception as e:
+            log.exception("porzuc: could not mark session failed")
+            await interaction.followup.send(
+                f"Nie udało się porzucić sesji: `{e}`.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            f"Sesja `{session_dir.name}` porzucona. "
+            f"Pliki zostały zachowane na dysku.",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="jaktojestbycskryba",

@@ -14,13 +14,15 @@ import prism from 'prism-media';
 import { log } from './log.js';
 
 export class RecordingSession {
-  constructor({ client, guildId, voiceChannelId, sessionDir, onSpeakerEvent }) {
+  constructor({ client, guildId, voiceChannelId, sessionDir, onSpeakerEvent, onHardFailure }) {
     this.client = client;
     this.guildId = guildId;
     this.voiceChannelId = voiceChannelId;
     this.sessionDir = sessionDir;
     this.audioDir = path.join(sessionDir, 'audio');
     this.onSpeakerEvent = onSpeakerEvent; // optional callback for IPC notifications
+    this.onHardFailure = onHardFailure;   // optional callback ({reason}) on unrecoverable voice failure
+    this.failureReported = false;         // dedupe: emit recording_failed at most once
 
     this.conn = null;
     /** @type {Map<string, fs.WriteStream>} */
@@ -29,6 +31,10 @@ export class RecordingSession {
     this.bytesPerUser = new Map();
     /** @type {Set<string>} */
     this.subscribedUsers = new Set();
+    /** @type {Map<string, import('stream').Readable>} */
+    this.opusStreams = new Map();
+    /** @type {Map<string, prism.opus.Decoder>} */
+    this.decoders = new Map();
     this.totalFrames = 0;
     this.stopped = false;
   }
@@ -56,8 +62,8 @@ export class RecordingSession {
     this.conn.receiver.speaking.on('start', (userId) => this._onSpeakingStart(userId));
 
     // If we get unexpectedly disconnected mid-recording, try to reconnect
-    // once; if that fails too, mark the connection destroyed and let stop()
-    // wrap up gracefully.
+    // once; if that fails too, mark the connection destroyed and notify
+    // Python so the session can be wrapped up on the parent side.
     this.conn.on(VoiceConnectionStatus.Disconnected, async () => {
       if (this.stopped) return;
       try {
@@ -69,7 +75,17 @@ export class RecordingSession {
       } catch {
         log.warn(`recorder[${this.guildId}]: unrecoverable disconnect, destroying`);
         try { this.conn.destroy(); } catch { /* ignore */ }
+        this._reportHardFailure('voice_disconnect');
       }
+    });
+
+    // Discord can revoke the voice session (kick from VC, channel deletion,
+    // permission change). The Destroyed state fires for both manual and
+    // forced teardowns — only treat as hard failure if we didn't initiate it.
+    this.conn.on(VoiceConnectionStatus.Destroyed, () => {
+      if (this.stopped) return;
+      log.warn(`recorder[${this.guildId}]: voice connection destroyed externally`);
+      this._reportHardFailure('voice_destroyed');
     });
 
     log.info(
@@ -95,6 +111,10 @@ export class RecordingSession {
     const writer = fs.createWriteStream(pcmPath, { flags: 'a' });
     this.writers.set(userId, writer);
     this.bytesPerUser.set(userId, 0);
+    // Track the upstreams per user so a decoder/opus error can tear down
+    // just this user's pipeline without disturbing other speakers.
+    this.opusStreams.set(userId, opusStream);
+    this.decoders.set(userId, decoder);
 
     log.info(`recorder[${this.guildId}]: first frame from ${userId} -> ${pcmPath}`);
 
@@ -112,16 +132,70 @@ export class RecordingSession {
     opusStream.pipe(decoder);
     decoder.on('data', (chunk) => {
       if (this.stopped) return;
+      // The writer may have been torn down by an error handler between two
+      // frames; check before touching it.
+      if (!this.writers.has(userId)) return;
       this.totalFrames += 1;
       this.bytesPerUser.set(userId, this.bytesPerUser.get(userId) + chunk.length);
-      writer.write(chunk);
+      const ok = writer.write(chunk);
+      if (!ok) {
+        // Disk pressure or slow fs — pause the decoder so PCM doesn't pile
+        // up in the Node heap until OOM. Resume once the OS write buffer
+        // has drained.
+        decoder.pause();
+        writer.once('drain', () => {
+          if (!this.stopped && this.decoders.get(userId) === decoder) {
+            decoder.resume();
+          }
+        });
+      }
     });
     decoder.on('error', (e) => {
-      log.warn(`recorder[${this.guildId}]: decoder error for ${userId}:`, e?.message || e);
+      log.warn(
+        `recorder[${this.guildId}]: decoder error for ${userId}: ${e?.message || e}; tearing down user stream`,
+      );
+      this._teardownUserStream(userId);
     });
     opusStream.on('error', (e) => {
-      log.warn(`recorder[${this.guildId}]: opus stream error for ${userId}:`, e?.message || e);
+      log.warn(
+        `recorder[${this.guildId}]: opus stream error for ${userId}: ${e?.message || e}; tearing down user stream`,
+      );
+      this._teardownUserStream(userId);
     });
+  }
+
+  _reportHardFailure(reason) {
+    if (this.failureReported || this.stopped) return;
+    this.failureReported = true;
+    if (this.onHardFailure) {
+      try {
+        this.onHardFailure({ reason });
+      } catch (e) {
+        log.warn(`recorder[${this.guildId}]: onHardFailure callback threw:`, e?.message || e);
+      }
+    }
+  }
+
+  /**
+   * Tear down one user's opus→decoder→writer chain after an error so that
+   * (a) the writer is closed and the PCM file isn't left half-open, and
+   * (b) the next `speaking start` event for the same user creates a fresh
+   * pipeline. Idempotent.
+   */
+  _teardownUserStream(userId) {
+    const opusStream = this.opusStreams?.get(userId);
+    const decoder = this.decoders?.get(userId);
+    const writer = this.writers.get(userId);
+    try { opusStream?.unpipe?.(decoder); } catch { /* ignore */ }
+    try { opusStream?.destroy?.(); } catch { /* ignore */ }
+    try { decoder?.destroy?.(); } catch { /* ignore */ }
+    if (writer) {
+      try { writer.end(); } catch { /* ignore */ }
+    }
+    this.opusStreams?.delete(userId);
+    this.decoders?.delete(userId);
+    this.writers.delete(userId);
+    this.subscribedUsers.delete(userId);
   }
 
   async _resolveDisplayName(userId) {

@@ -5,6 +5,12 @@
     "albo poczekaj — bot wznowi sesję przy następnym uruchomieniu."
 )
 
+RECORDING_CUT_SHORT = (
+    "⚠️ **Nagrywanie zostało przerwane** (`{reason}`). "
+    "Uruchamiam pipeline na audio nagranym do tej pory — "
+    "podsumowanie może być krótsze niż zwykle."
+)
+
 
 SKRYBA="""\
 Jak to jest być skrybą, dobrze?

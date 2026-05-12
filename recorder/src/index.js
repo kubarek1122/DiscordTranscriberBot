@@ -49,6 +49,12 @@ async function onJoin({ guild_id, voice_channel_id, session_dir, send }) {
     onSpeakerEvent: ({ user_id, display_name }) => {
       send({ op: 'speaker', guild_id, user_id, display_name });
     },
+    onHardFailure: ({ reason }) => {
+      // Tell Python the recording was cut short by something Discord-side
+      // (kicked, channel deleted, voice gateway gave up). Python decides
+      // whether to keep the PCM and run the pipeline anyway.
+      send({ op: 'recording_failed', guild_id, reason });
+    },
   });
   try {
     await session.start();

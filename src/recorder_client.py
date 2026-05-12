@@ -25,7 +25,14 @@ class RecorderClient:
         self._socket_path = str(socket_path)
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        # Three streams of inbound messages, separated so callers can wait on
+        # exactly what they care about:
+        #   _reply_q     — command replies + hello + bad-protocol errors
+        #   _unsolicited — `speaker` events (informational)
+        #   _alerts      — `recording_failed` and other "you should react now"
+        #                  pushes from the sidecar
         self._unsolicited: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._alerts: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._reader_task: asyncio.Task | None = None
         self._hello_seen = False
         self._reply_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -60,10 +67,16 @@ class RecorderClient:
                     log.warning("recorder-client: bad json: %r", line)
                     continue
                 op = msg.get("op")
-                # Asynchronous notifications (speaker events) go on a side
-                # queue so they don't get confused with command replies.
+                # Asynchronous notifications go on side queues so they don't
+                # get confused with command replies.
                 if op == "speaker":
                     await self._unsolicited.put(msg)
+                elif op == "recording_failed":
+                    log.warning(
+                        "recorder-client: sidecar reported recording_failed: %s",
+                        msg,
+                    )
+                    await self._alerts.put(msg)
                 else:
                     await self._reply_q.put(msg)
         except Exception:
@@ -132,6 +145,12 @@ class RecorderClient:
         """Caller can `await client.speaker_events().get()` in a background task
         to learn of newly-detected speakers (informational only)."""
         return self._unsolicited
+
+    async def alerts(self) -> asyncio.Queue[dict[str, Any]]:
+        """Caller can `await client.alerts().get()` to learn of unrecoverable
+        sidecar events that warrant ending the current session early
+        (e.g. recording_failed)."""
+        return self._alerts
 
     async def close(self) -> None:
         if self._writer is not None:

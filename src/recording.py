@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import discord
 
@@ -18,7 +19,17 @@ log = logging.getLogger(__name__)
 
 
 def _ffmpeg_pcm_to_wav(pcm_path: Path, wav_path: Path) -> None:
-    """Convert 48kHz stereo s16le raw PCM into 16kHz mono WAV for Whisper."""
+    """Convert 48kHz stereo s16le raw PCM into 16kHz mono WAV for Whisper.
+
+    Bounded: 48 kHz stereo s16le = ~11 MB/min, so a 1-hour recording is ~660 MB.
+    We allow 2 s per MB of input (very generous — typical ffmpeg PCM→WAV runs at
+    well over 100×) but never less than 30 s. On timeout we kill the subprocess
+    and re-raise; the caller's failure/retry path takes over."""
+    try:
+        size_mb = max(1, pcm_path.stat().st_size // (1024 * 1024))
+    except OSError:
+        size_mb = 1
+    timeout_s = max(30, size_mb * 2)
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -32,7 +43,19 @@ def _ffmpeg_pcm_to_wav(pcm_path: Path, wav_path: Path) -> None:
         "-ac", "1",
         str(wav_path),
     ]
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        log.error(
+            "ffmpeg timed out after %ds converting %s (size=%dMB)",
+            timeout_s, pcm_path.name, size_mb,
+        )
+        # Partial WAV is unusable; remove so the next pass re-tries cleanly.
+        try:
+            wav_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def finalize_audio(session_dir: Path) -> None:
@@ -78,8 +101,13 @@ class RecordingSession:
     state: SessionState
     cfg: AppConfig
     client: RecorderClient
+    # Called when the sidecar reports a hard failure (kicked from VC, voice
+    # gateway gave up). The bot wires this to `_auto_stop_session` so the
+    # captured PCM still goes through the pipeline.
+    on_hard_failure: Callable[[str], Awaitable[None]] | None = field(default=None, repr=False)
     _heartbeat_task: asyncio.Task | None = field(default=None, repr=False)
     _speaker_task: asyncio.Task | None = field(default=None, repr=False)
+    _alert_task: asyncio.Task | None = field(default=None, repr=False)
     _log_handler: logging.Handler | None = field(default=None, repr=False)
     _stopped: bool = False
 
@@ -90,6 +118,7 @@ class RecordingSession:
         voice_channel: discord.VoiceChannel,
         text_channel_id: int,
         cfg: AppConfig,
+        on_hard_failure: Callable[[str], Awaitable[None]] | None = None,
     ) -> "RecordingSession":
         guild = voice_channel.guild
         state = SessionState.new(
@@ -114,6 +143,7 @@ class RecordingSession:
             state=state,
             cfg=cfg,
             client=client,
+            on_hard_failure=on_hard_failure,
         )
 
     async def start(self) -> None:
@@ -135,6 +165,7 @@ class RecordingSession:
             raise
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._speaker_task = asyncio.create_task(self._speaker_loop())
+        self._alert_task = asyncio.create_task(self._alert_loop())
         log.info("recording started in %s", self.session_dir)
 
     async def _heartbeat_loop(self) -> None:
@@ -178,11 +209,47 @@ class RecordingSession:
         except Exception:
             log.exception("speaker_loop crashed")
 
+    async def _alert_loop(self) -> None:
+        """Drain the sidecar's alert queue. On `recording_failed`, schedule
+        the bot-supplied `on_hard_failure` callback as a *separate task* and
+        exit immediately.
+
+        The detached task is important: `on_hard_failure` typically calls
+        `bot._auto_stop_session` which in turn calls `session.stop()`, and
+        `session.stop()` cancels-and-awaits this alert task. Doing the
+        handler inline would deadlock on `await self._alert_task`.
+
+        Once we've seen one `recording_failed` we exit — Discord doesn't
+        recover voice in-place, and we don't want to double-fire."""
+        try:
+            queue = await self.client.alerts()
+            while not self._stopped:
+                msg = await queue.get()
+                if msg.get("op") != "recording_failed":
+                    continue
+                reason = str(msg.get("reason") or "unknown")
+                log.warning("alert: recording_failed reason=%s", reason)
+                if self.on_hard_failure is not None:
+                    asyncio.create_task(self._invoke_hard_failure(reason))
+                return
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("alert_loop crashed")
+
+    async def _invoke_hard_failure(self, reason: str) -> None:
+        if self.on_hard_failure is None:
+            return
+        try:
+            await self.on_hard_failure(reason)
+        except Exception:
+            log.exception("on_hard_failure callback raised")
+
     async def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        for task in (self._heartbeat_task, self._speaker_task):
+        for task in (self._heartbeat_task, self._speaker_task, self._alert_task):
             if task is not None:
                 task.cancel()
                 try:

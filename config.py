@@ -50,6 +50,14 @@ class RecordingConfig(BaseModel):
 class ReliabilityConfig(BaseModel):
     summarizer_retries: int = 3
     post_retries: int = 5
+    # How many times the top-level pipeline may be attempted before the
+    # session is marked terminally `failed`. Each `/skryba kontynuuj`,
+    # recovery scan and `/skryba stop` invocation counts as one attempt.
+    max_pipeline_retries: int = 5
+    # Upper bound on the time the startup recovery scan spends on a single
+    # session before giving up and moving to the next one. The timeout
+    # itself counts as a retry attempt against `max_pipeline_retries`.
+    recovery_per_session_timeout_s: int = 600
 
 
 class RecorderConfig(BaseModel):
