@@ -9,7 +9,11 @@ class ClaudeSummarizer:
     name = "claude"
 
     def __init__(self, *, api_key: str, model: str, max_tokens: int) -> None:
-        self._client = AsyncAnthropic(api_key=api_key)
+        # The SDK honours `Retry-After` on 429/529/5xx, which is what the
+        # API actually wants us to do during overloads. Bump from the
+        # default of 2 to give the outer tenacity loop slack on sustained
+        # overloads (the two work multiplicatively).
+        self._client = AsyncAnthropic(api_key=api_key, max_retries=4)
         self._model = model
         self._max_tokens = max_tokens
 

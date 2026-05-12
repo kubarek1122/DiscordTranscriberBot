@@ -48,7 +48,14 @@ class RecordingConfig(BaseModel):
 
 
 class ReliabilityConfig(BaseModel):
-    summarizer_retries: int = 3
+    # Outer retry loop around the summarizer backend. The Anthropic SDK
+    # already does its own Retry-After-honouring retries internally, so
+    # this is the second layer that catches *sustained* overloads.
+    summarizer_retries: int = 5
+    # Upper bound on the exponential backoff between summarizer attempts.
+    # Anthropic 529s during model overloads can last minutes — let the
+    # backoff grow so we don't burn the budget in 30 s.
+    summarizer_backoff_max_s: int = 60
     post_retries: int = 5
     # How many times the top-level pipeline may be attempted before the
     # session is marked terminally `failed`. Each `/skryba kontynuuj`,

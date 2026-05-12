@@ -144,7 +144,9 @@ async def _summarize_with_retry(
 ) -> str:
     async for attempt in AsyncRetrying(
         stop=stop_after_attempt(cfg.reliability.summarizer_retries),
-        wait=wait_exponential(multiplier=1, min=1, max=16),
+        wait=wait_exponential(
+            multiplier=1, min=1, max=cfg.reliability.summarizer_backoff_max_s
+        ),
         reraise=True,
     ):
         with attempt:
