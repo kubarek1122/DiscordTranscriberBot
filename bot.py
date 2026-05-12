@@ -3,18 +3,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 from datetime import datetime, timezone
 from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands, voice_recv
+from discord.ext import commands
 
 from config import AppConfig, load_config
+from src.logging_util import session_log
 from src.messages import SKRYBA
-from src.pipeline import run_pipeline
+from src.pipeline import notify_pipeline_failure, run_pipeline
 from src.recording import RecordingSession, ensure_ffmpeg, finalize_audio
-from src.session import SessionState, is_heartbeat_stale, scan_unfinished
+from src.session import (
+    SessionState,
+    is_heartbeat_stale,
+    most_recent_unfinished,
+    scan_unfinished,
+)
 from src.transcribe import Transcriber
 
 logging.basicConfig(
@@ -24,28 +31,15 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 
-def _load_opus() -> None:
-    """Force-load libopus so voice_recv can decode incoming Opus → PCM.
+class _DropDiscordVoiceWarnings(logging.Filter):
+    """Suppress discord.py's "PyNaCl/davey is not installed, voice will NOT
+    be supported" warnings. We don't do voice here — the Node sidecar does."""
 
-    discord.py auto-loads on most platforms but silently no-ops if the lib
-    name doesn't match. On Ubuntu the .so is at libopus.so.0; try a few
-    candidates and log the outcome."""
-    if discord.opus.is_loaded():
-        log.info("opus already loaded")
-        return
-    candidates = ("opus", "libopus.so.0", "libopus.0.dylib", "libopus-0.dll")
-    for name in candidates:
-        try:
-            discord.opus.load_opus(name)
-            if discord.opus.is_loaded():
-                log.info("loaded opus from %s", name)
-                return
-        except Exception as e:  # noqa: PERF203
-            log.debug("opus load %s failed: %s", name, e)
-    log.error(
-        "libopus could not be loaded — voice receive will produce empty PCM. "
-        "Install libopus0 (Linux) / opus (mac) / libopus-0.dll (Windows)."
-    )
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "voice will NOT be supported" not in record.getMessage()
+
+
+logging.getLogger("discord.client").addFilter(_DropDiscordVoiceWarnings())
 
 
 class TranscriberBot(commands.Bot):
@@ -94,6 +88,33 @@ class TranscriberBot(commands.Bot):
         except Exception:
             log.exception("recovery scan failed")
 
+    async def close(self) -> None:  # type: ignore[override]
+        """Graceful shutdown. Stops every active session so the recorder
+        sidecar flushes PCM to disk and the on-disk state advances to
+        `recorded`. The next startup's recovery scan will resume the
+        pipeline and post the summary.
+
+        Without this hook, SIGTERM tears down the IPC socket abruptly —
+        the recorder eventually notices via socket close and finalizes,
+        but Python's `state.stage` is left at `recording` and only
+        rescued by the heartbeat-stale check on next startup. This hook
+        gets us to `recorded` cleanly."""
+        if self.sessions:
+            log.info(
+                "shutdown: stopping %d active session(s)", len(self.sessions)
+            )
+            for guild_id, session in list(self.sessions.items()):
+                try:
+                    await session.stop()
+                except Exception:
+                    log.exception(
+                        "shutdown: error stopping session for guild %s", guild_id
+                    )
+                finally:
+                    session.release_log()
+                self.sessions.pop(guild_id, None)
+        await super().close()
+
     async def _recover_unfinished(self) -> None:
         unfinished = scan_unfinished(self.cfg.recording.output_dir)
         if not unfinished:
@@ -123,48 +144,22 @@ class TranscriberBot(commands.Bot):
                     continue
 
             try:
-                await run_pipeline(
-                    session_dir=session_dir,
-                    cfg=self.cfg,
-                    transcriber=self.transcriber,
-                    bot=self,
-                )
+                with session_log(session_dir):
+                    await run_pipeline(
+                        session_dir=session_dir,
+                        cfg=self.cfg,
+                        transcriber=self.transcriber,
+                        bot=self,
+                    )
                 log.info("recovery: completed %s", session_dir)
-            except Exception:
+            except Exception as e:
                 log.exception("recovery: pipeline failed for %s", session_dir)
-
-    async def on_voice_state_update(  # type: ignore[override]
-        self,
-        member: discord.Member,
-        before: discord.VoiceState,
-        after: discord.VoiceState,
-    ) -> None:
-        session = self.sessions.get(member.guild.id)
-        if session is None:
-            return
-        # If our bot got disconnected from voice, finalize the session.
-        if (
-            self.user is not None
-            and member.id == self.user.id
-            and before.channel is not None
-            and after.channel is None
-        ):
-            log.warning("bot disconnected from voice, finalizing session")
-            try:
-                await session.stop()
-            except Exception:
-                log.exception("error stopping session after disconnect")
-            self.sessions.pop(member.guild.id, None)
-            try:
-                await run_pipeline(
-                    session_dir=session.session_dir,
-                    cfg=self.cfg,
-                    transcriber=self.transcriber,
+                await notify_pipeline_failure(
                     bot=self,
+                    text_channel_id=state.text_channel_id,
+                    session_dir=session_dir,
+                    error=e,
                 )
-            except Exception:
-                log.exception("post-disconnect pipeline failed")
-
 
 def _user_voice_channel(
     interaction: discord.Interaction,
@@ -210,44 +205,28 @@ class SkrybaGroup(app_commands.Group):
             )
             return
 
-        try:
-            voice_client = await vc_channel.connect(
-                cls=voice_recv.VoiceRecvClient,
-                self_deaf=False,
-                self_mute=True,
-            )
-        except discord.ClientException:
-            existing = guild.voice_client
-            if (
-                isinstance(existing, voice_recv.VoiceRecvClient)
-                and existing.channel.id == vc_channel.id
-            ):
-                voice_client = existing
-            else:
-                await interaction.followup.send(
-                    "Nie udało się dołączyć do kanału głosowego.", ephemeral=True
-                )
-                return
-        except Exception as e:
-            log.exception("voice connect failed")
-            await interaction.followup.send(
-                f"Błąd przy dołączaniu do kanału: `{e}`", ephemeral=True
-            )
-            return
-
         if interaction.channel_id is None:
             await interaction.followup.send(
                 "Nie można ustalić kanału tekstowego.", ephemeral=True
             )
-            await voice_client.disconnect(force=False)
             return
 
         session = RecordingSession.create(
-            voice_client=voice_client,
+            voice_channel=vc_channel,
             text_channel_id=interaction.channel_id,
             cfg=self.bot.cfg,
         )
-        session.start()
+        try:
+            await session.start()
+        except Exception as e:
+            log.exception("recorder start failed")
+            await interaction.followup.send(
+                f"Nie udało się uruchomić nagrywania: `{e}`. "
+                f"Sprawdź czy bot-rejestrator jest online.",
+                ephemeral=True,
+            )
+            return
+
         self.bot.sessions[guild.id] = session
         await interaction.followup.send(
             f"Nagrywam na kanale **{vc_channel.name}**. "
@@ -270,6 +249,7 @@ class SkrybaGroup(app_commands.Group):
 
         session = self.bot.sessions.pop(guild.id)
         session_dir = session.session_dir
+        text_channel_id = session.text_channel_id
         await session.stop()
 
         await interaction.followup.send(
@@ -286,15 +266,25 @@ class SkrybaGroup(app_commands.Group):
             )
         except Exception as e:
             log.exception("pipeline failed for session %s", session_dir)
+            # Tell both the invoker (ephemeral, may not be seen) and the
+            # original channel (persistent, others can act on it via
+            # /skryba kontynuuj).
             try:
                 await interaction.followup.send(
                     f"Pipeline zakończył się błędem: `{e}`. "
-                    f"Pliki zostały zapisane w `{session_dir}` i będą wznowione "
-                    f"przy następnym starcie bota.",
+                    f"Spróbuj `/skryba kontynuuj` lub poczekaj na restart.",
                     ephemeral=True,
                 )
             except Exception:
                 pass
+            await notify_pipeline_failure(
+                bot=self.bot,
+                text_channel_id=text_channel_id,
+                session_dir=session_dir,
+                error=e,
+            )
+        finally:
+            session.release_log()
 
     @app_commands.command(
         name="status",
@@ -325,6 +315,72 @@ class SkrybaGroup(app_commands.Group):
         )
 
     @app_commands.command(
+        name="kontynuuj",
+        description="Wznawia ostatnią niedokończoną sesję na tym serwerze.",
+    )
+    async def kontynuuj(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send(
+                "Komenda działa tylko na serwerze.", ephemeral=True
+            )
+            return
+        if guild.id in self.bot.sessions:
+            await interaction.followup.send(
+                "Trwa nagrywanie — najpierw zakończ przez `/skryba stop`.",
+                ephemeral=True,
+            )
+            return
+
+        session_dir = most_recent_unfinished(
+            self.bot.cfg.recording.output_dir, guild.id
+        )
+        if session_dir is None:
+            await interaction.followup.send(
+                "Nie znalazłem żadnej niedokończonej sesji na tym serwerze.",
+                ephemeral=True,
+            )
+            return
+
+        state = SessionState.load(session_dir)
+        # Tolerate sessions whose recording never reached `recorded` (e.g.
+        # SIGKILL during capture): finalize the PCM we have on disk first.
+        if state.stage == "recording":
+            finalize_audio(session_dir)
+            state.advance(session_dir, "recorded")
+            state = SessionState.load(session_dir)
+
+        await interaction.followup.send(
+            f"Wznawiam sesję `{session_dir.name}` od etapu `{state.stage}`…",
+            ephemeral=True,
+        )
+
+        try:
+            with session_log(session_dir):
+                await run_pipeline(
+                    session_dir=session_dir,
+                    cfg=self.bot.cfg,
+                    transcriber=self.bot.transcriber,
+                    bot=self.bot,
+                )
+        except Exception as e:
+            log.exception("kontynuuj: pipeline failed for %s", session_dir)
+            try:
+                await interaction.followup.send(
+                    f"Pipeline ponownie zakończył się błędem: `{e}`.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            await notify_pipeline_failure(
+                bot=self.bot,
+                text_channel_id=state.text_channel_id,
+                session_dir=session_dir,
+                error=e,
+            )
+
+    @app_commands.command(
         name="jaktojestbycskryba",
         description="Jak to jest być skrybą, dobrze?",
     )
@@ -341,12 +397,50 @@ def make_bot(cfg: AppConfig) -> TranscriberBot:
     return TranscriberBot(cfg)
 
 
+async def _run(cfg: AppConfig) -> None:
+    bot = make_bot(cfg)
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _on_signal(signame: str) -> None:
+        log.info("received %s, initiating graceful shutdown", signame)
+        stop_event.set()
+
+    # SIGTERM = `docker compose stop`. SIGINT = Ctrl+C. Both should let
+    # TranscriberBot.close() run so active sessions advance to `recorded`
+    # before the process exits.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal, sig.name)
+        except NotImplementedError:
+            # Windows asyncio doesn't support add_signal_handler; the
+            # default discord.py KeyboardInterrupt path covers SIGINT
+            # there, and SIGTERM isn't really a thing on Windows.
+            pass
+
+    async with bot:
+        login_task = asyncio.create_task(
+            bot.start(cfg.secrets.discord_token), name="bot.start"
+        )
+        stop_task = asyncio.create_task(stop_event.wait(), name="stop.wait")
+        done, pending = await asyncio.wait(
+            {login_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        # Surface any unexpected error from bot.start (e.g. bad token).
+        for task in done:
+            if task is login_task and task.exception() is not None:
+                raise task.exception()  # type: ignore[misc]
+
+
 def main() -> None:
     cfg = load_config()
     ensure_ffmpeg()
-    _load_opus()
-    bot = make_bot(cfg)
-    bot.run(cfg.secrets.discord_token)
+    try:
+        asyncio.run(_run(cfg))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

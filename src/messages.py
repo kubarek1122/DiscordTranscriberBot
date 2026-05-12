@@ -1,4 +1,12 @@
-﻿SKRYBA="""\
+﻿PIPELINE_FAILED = (
+    "⚠️ **Nie udało się utworzyć podsumowania** dla sesji `{session_name}`.\n"
+    "Powód: `{error}`\n"
+    "Pliki zostały zachowane na dysku. Spróbuj `/skryba kontynuuj`, "
+    "albo poczekaj — bot wznowi sesję przy następnym uruchomieniu."
+)
+
+
+SKRYBA="""\
 Jak to jest być skrybą, dobrze?
 
 A, wie pan, moim zdaniem to nie ma tak, że dobrze, albo że niedobrze.

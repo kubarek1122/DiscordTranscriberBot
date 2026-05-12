@@ -18,8 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.11-distutils \
         python3-pip \
         ffmpeg \
-        libsodium23 \
-        libopus0 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python \

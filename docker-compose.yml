@@ -9,6 +9,9 @@ services:
       - ./recordings:/app/recordings
       - ./config.yaml:/app/config.yaml:ro
       - whisper-models:/root/.cache/huggingface
+      - skryba-ipc:/tmp/skryba
+    depends_on:
+      - recorder
     deploy:
       resources:
         reservations:
@@ -16,6 +19,20 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  recorder:
+    build: ./recorder
+    image: discord-transcriber-recorder:latest
+    container_name: discord-transcriber-recorder
+    restart: unless-stopped
+    env_file: ./recorder/.env
+    environment:
+      IPC_SOCKET: /tmp/skryba/recorder.sock
+    volumes:
+      # Same on-disk location as the bot so per-user .pcm files appear
+      # at the path the bot expects.
+      - ./recordings:/app/recordings
+      - skryba-ipc:/tmp/skryba
 
   # Uncomment if you set summarizer.backend: ollama in config.yaml.
   # ollama:
@@ -36,4 +53,5 @@ services:
 
 volumes:
   whisper-models:
+  skryba-ipc:
   # ollama-data:

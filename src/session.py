@@ -78,6 +78,31 @@ def make_session_dir(root: Path, guild_id: int, started_at_iso: str) -> Path:
     return d
 
 
+def most_recent_unfinished(root: Path, guild_id: int) -> Path | None:
+    """Newest session directory for `guild_id` whose stage is not `posted`.
+
+    Used by `/skryba kontynuuj` to retry the latest failed pipeline without
+    waiting for a bot restart."""
+    guild_dir = root / str(guild_id)
+    if not guild_dir.exists():
+        return None
+    for session_dir in sorted(
+        (p for p in guild_dir.iterdir() if p.is_dir()),
+        key=lambda p: p.name,
+        reverse=True,
+    ):
+        sj = session_dir / "session.json"
+        if not sj.exists():
+            continue
+        try:
+            state = SessionState.load(session_dir)
+        except Exception:
+            continue
+        if state.stage != "posted":
+            return session_dir
+    return None
+
+
 def scan_unfinished(root: Path) -> list[Path]:
     """Return session dirs whose session.json has stage != 'posted'."""
     if not root.exists():

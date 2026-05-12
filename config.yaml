@@ -27,3 +27,10 @@ recording:
 reliability:
   summarizer_retries: 3
   post_retries: 5
+
+recorder:
+  # Unix-socket path to the Node sidecar. Must match IPC_SOCKET in
+  # docker-compose.yml and be mounted into both containers.
+  socket_path: /tmp/skryba/recorder.sock
+  join_timeout_s: 15.0
+  leave_timeout_s: 15.0

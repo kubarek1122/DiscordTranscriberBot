@@ -14,6 +14,7 @@ from tenacity import (
 
 from config import AppConfig
 from src.artifacts import write_actions, write_summary, write_transcript
+from src.messages import PIPELINE_FAILED
 from src.recording import cleanup_audio_files, finalize_audio
 from src.session import STAGE_ORDER, SessionState, Stage  # noqa: F401
 from src.summarize import Summarizer, get_summarizer
@@ -148,3 +149,30 @@ async def _post_with_retry(
             state.posted_message_id = msg.id
             state.advance(session_dir, "posted")
             return
+
+
+async def notify_pipeline_failure(
+    *,
+    bot: discord.Client,
+    text_channel_id: int,
+    session_dir: Path,
+    error: BaseException,
+) -> None:
+    """Post a Polish failure notice to the original text channel.
+
+    Best-effort: swallows exceptions so the caller's error path is not
+    derailed by a secondary failure. Truncates the error message to keep
+    the channel readable."""
+    err_text = str(error) or error.__class__.__name__
+    if len(err_text) > 200:
+        err_text = err_text[:200] + "…"
+    body = PIPELINE_FAILED.format(session_name=session_dir.name, error=err_text)
+    try:
+        channel = bot.get_channel(text_channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(text_channel_id)
+        await channel.send(body)
+    except Exception:
+        log.exception(
+            "notify_pipeline_failure: could not post to channel %s", text_channel_id
+        )

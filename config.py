@@ -52,6 +52,12 @@ class ReliabilityConfig(BaseModel):
     post_retries: int = 5
 
 
+class RecorderConfig(BaseModel):
+    socket_path: Path = Path("/tmp/skryba/recorder.sock")
+    join_timeout_s: float = 15.0
+    leave_timeout_s: float = 15.0
+
+
 class Secrets(BaseModel):
     discord_token: str
     anthropic_api_key: str | None = None
@@ -63,6 +69,7 @@ class AppConfig(BaseModel):
     summarizer: SummarizerConfig = Field(default_factory=SummarizerConfig)
     recording: RecordingConfig = Field(default_factory=RecordingConfig)
     reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
+    recorder: RecorderConfig = Field(default_factory=RecorderConfig)
     secrets: Secrets
 
 
