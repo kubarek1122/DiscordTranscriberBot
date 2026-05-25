@@ -13,6 +13,18 @@ import {
 import prism from 'prism-media';
 import { log } from './log.js';
 
+// 48 kHz × 2 channels × 2 bytes = 192 bytes per millisecond of s16le PCM.
+const BYTES_PER_MS = 192;
+
+// Reusable zero-filled buffer for filling inter-utterance silence gaps in
+// the per-user PCM streams. Discord's voice gateway only delivers RTP
+// frames while a user is actively speaking, so without this padding each
+// .pcm file would be a concatenation of speech bursts with no
+// representation of the silence between them — destroying session
+// timing. 200 ms keeps the buffer small enough that backpressure can kick
+// in mid-pad on a long silence; for short tails we `.subarray()`.
+const PCM_SILENCE_CHUNK = Buffer.alloc(BYTES_PER_MS * 200);
+
 export class RecordingSession {
   constructor({ client, guildId, voiceChannelId, sessionDir, onSpeakerEvent, onHardFailure }) {
     this.client = client;
@@ -35,12 +47,28 @@ export class RecordingSession {
     this.opusStreams = new Map();
     /** @type {Map<string, prism.opus.Decoder>} */
     this.decoders = new Map();
+    /**
+     * Total bytes (audio + silence padding) written to each user's PCM file.
+     * Distinct from `bytesPerUser`, which counts only real audio for stats.
+     * We use this to compute "where in the session does this file currently
+     * end?" so the next chunk's silence pad is correct, even after a
+     * decoder error / teardown / rebuild cycle (T1f).
+     * @type {Map<string, number>}
+     */
+    this.fileBytes = new Map();
     this.totalFrames = 0;
     this.stopped = false;
+    // Captured in start() so every chunk's pad-bytes can be derived from
+    // (now - sessionStartMs). The byte offset N in <user>.pcm corresponds
+    // to session time N / BYTES_PER_MS — making file-local time and
+    // session wall-clock time equal, which is what `transcribe_session`
+    // assumes when sorting segments.
+    this.sessionStartMs = 0;
   }
 
   async start() {
     fs.mkdirSync(this.audioDir, { recursive: true });
+    this.sessionStartMs = Date.now();
     const guild = await this.client.guilds.fetch(this.guildId);
     const channel = await guild.channels.fetch(this.voiceChannelId);
     if (!channel?.isVoiceBased()) {
@@ -60,6 +88,37 @@ export class RecordingSession {
     await entersState(this.conn, VoiceConnectionStatus.Ready, 15_000);
 
     this.conn.receiver.speaking.on('start', (userId) => this._onSpeakingStart(userId));
+
+    // When a user leaves the recorded VC, Discord frees their SSRC. Our
+    // existing opus subscription is bound to that dead SSRC, so it just
+    // goes silent — and when they rejoin (or move back) Discord assigns
+    // a fresh SSRC, but `_onSpeakingStart` would early-return because the
+    // userId is still in `subscribedUsers`. Result: post-rejoin audio is
+    // silently dropped.
+    //
+    // Tear down on leave so the next `speaking.start` rebuilds against
+    // the new SSRC. `fileBytes` survives teardown (see
+    // `_teardownUserStream`), so the next chunk's pad fills the gap
+    // between when they left and when they spoke again.
+    this._onVoiceStateUpdate = (oldState, newState) => {
+      if (this.stopped) return;
+      // Ignore the recorder bot's own moves (we destroy/recreate the
+      // voice connection ourselves; that's not a "user left" event).
+      const selfId = this.client.user?.id;
+      if (selfId && newState.id === selfId) return;
+      const wasHere = oldState.channelId === this.voiceChannelId;
+      const stillHere = newState.channelId === this.voiceChannelId;
+      if (wasHere && !stillHere) {
+        const userId = newState.id;
+        if (this.subscribedUsers.has(userId)) {
+          log.info(
+            `recorder[${this.guildId}]: ${userId} left VC, tearing down stream so next speech re-subscribes`,
+          );
+          this._teardownUserStream(userId);
+        }
+      }
+    };
+    this.client.on('voiceStateUpdate', this._onVoiceStateUpdate);
 
     // If we get unexpectedly disconnected mid-recording, try to reconnect
     // once; if that fails too, mark the connection destroyed and notify
@@ -110,13 +169,30 @@ export class RecordingSession {
     const pcmPath = path.join(this.audioDir, `${userId}.pcm`);
     const writer = fs.createWriteStream(pcmPath, { flags: 'a' });
     this.writers.set(userId, writer);
-    this.bytesPerUser.set(userId, 0);
+    if (!this.bytesPerUser.has(userId)) {
+      this.bytesPerUser.set(userId, 0);
+    }
+    // After a decoder-error teardown (T1f) the file may already exist; pick
+    // up the byte count from disk so the next pad-then-write resumes from
+    // the right session offset instead of double-padding from 0.
+    if (!this.fileBytes.has(userId)) {
+      let existing = 0;
+      try {
+        existing = fs.statSync(pcmPath).size;
+      } catch (_) {
+        // File doesn't exist yet on first subscribe — that's fine.
+      }
+      this.fileBytes.set(userId, existing);
+    }
     // Track the upstreams per user so a decoder/opus error can tear down
     // just this user's pipeline without disturbing other speakers.
     this.opusStreams.set(userId, opusStream);
     this.decoders.set(userId, decoder);
 
-    log.info(`recorder[${this.guildId}]: first frame from ${userId} -> ${pcmPath}`);
+    const offsetMs = Math.max(0, Date.now() - this.sessionStartMs);
+    log.info(
+      `recorder[${this.guildId}]: first frame from ${userId} (+${offsetMs}ms) -> ${pcmPath}`,
+    );
 
     if (this.onSpeakerEvent) {
       this._resolveDisplayName(userId).then((displayName) => {
@@ -135,9 +211,43 @@ export class RecordingSession {
       // The writer may have been torn down by an error handler between two
       // frames; check before touching it.
       if (!this.writers.has(userId)) return;
+
+      // Pad with silence so the file's byte position matches session time.
+      // The chunk represents 20 ms of audio ending at `wallMs`; we want
+      // the file to be exactly `wallMs` ms long after this chunk lands.
+      const wallMs = Date.now() - this.sessionStartMs;
+      const targetBytes = wallMs * BYTES_PER_MS;
+      const currentBytes = this.fileBytes.get(userId) || 0;
+      let padBytes = targetBytes - chunk.length - currentBytes;
+      // During active speech, frames arrive every ~20 ms and padBytes is
+      // ~0 (modulo jitter); after a silence it's the full pause length.
+      // Clamp negatives — over-arrival is harmless, we just skip padding.
+      while (padBytes > 0) {
+        const slice =
+          padBytes >= PCM_SILENCE_CHUNK.length
+            ? PCM_SILENCE_CHUNK
+            : PCM_SILENCE_CHUNK.subarray(0, padBytes);
+        const okPad = writer.write(slice);
+        this.fileBytes.set(
+          userId,
+          (this.fileBytes.get(userId) || 0) + slice.length,
+        );
+        padBytes -= slice.length;
+        if (!okPad) {
+          // Backpressure mid-pad: stop padding for now, let drain re-fire
+          // the decoder. The remaining pad will be re-computed on the
+          // next data event (which will see a still-large wallMs gap).
+          break;
+        }
+      }
+
       this.totalFrames += 1;
       this.bytesPerUser.set(userId, this.bytesPerUser.get(userId) + chunk.length);
       const ok = writer.write(chunk);
+      this.fileBytes.set(
+        userId,
+        (this.fileBytes.get(userId) || 0) + chunk.length,
+      );
       if (!ok) {
         // Disk pressure or slow fs — pause the decoder so PCM doesn't pile
         // up in the Node heap until OOM. Resume once the OS write buffer
@@ -196,6 +306,9 @@ export class RecordingSession {
     this.decoders?.delete(userId);
     this.writers.delete(userId);
     this.subscribedUsers.delete(userId);
+    // Intentionally NOT deleting fileBytes / bytesPerUser: the file
+    // still exists on disk and the next `speaking start` for this user
+    // must resume padding from the current file end, not from 0.
   }
 
   async _resolveDisplayName(userId) {
@@ -211,6 +324,15 @@ export class RecordingSession {
   async stop() {
     if (this.stopped) return this._stats();
     this.stopped = true;
+
+    // Detach the long-lived client listener so finished sessions don't
+    // leak references back to the discord.js Client.
+    if (this._onVoiceStateUpdate) {
+      try {
+        this.client.off('voiceStateUpdate', this._onVoiceStateUpdate);
+      } catch { /* ignore */ }
+      this._onVoiceStateUpdate = null;
+    }
 
     // Tear down subscriptions
     for (const userId of this.subscribedUsers) {

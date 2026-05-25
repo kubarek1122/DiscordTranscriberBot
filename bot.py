@@ -257,33 +257,34 @@ class SkrybaGroup(app_commands.Group):
         description="Dołącza do twojego kanału głosowego i zaczyna nagrywać.",
     )
     async def start(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
+        # Validate BEFORE deferring so error responses are cleanly ephemeral
+        # (no public "Bot is thinking…" left hanging over a user mistake).
         guild = interaction.guild
         if guild is None:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Komenda działa tylko na serwerze.", ephemeral=True
             )
             return
-
         if guild.id in self.bot.sessions:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Już nagrywam na tym serwerze. Użyj `/skryba stop`, aby zakończyć.",
                 ephemeral=True,
             )
             return
-
         vc_channel = _user_voice_channel(interaction)
         if vc_channel is None:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Musisz najpierw wejść na kanał głosowy.", ephemeral=True
             )
             return
-
         if interaction.channel_id is None:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Nie można ustalić kanału tekstowego.", ephemeral=True
             )
             return
+
+        # Past validation — commit to a public response.
+        await interaction.response.defer(ephemeral=False)
 
         # The sidecar uses this callback to surface kicks / voice-gateway
         # giveups; the bot then auto-stops the session and runs the pipeline
@@ -301,18 +302,21 @@ class SkrybaGroup(app_commands.Group):
             await session.start()
         except Exception as e:
             log.exception("recorder start failed")
+            # Public so others in the channel know recording did NOT start
+            # (they were probably expecting it to after the slash command).
             await interaction.followup.send(
-                f"Nie udało się uruchomić nagrywania: `{e}`. "
+                f"⚠️ Nie udało się uruchomić nagrywania: `{e}`. "
                 f"Sprawdź czy bot-rejestrator jest online.",
-                ephemeral=True,
+                ephemeral=False,
             )
             return
 
         self.bot.sessions[guild.id] = session
+        # Public so the whole channel sees recording has started.
         await interaction.followup.send(
-            f"Nagrywam na kanale **{vc_channel.name}**. "
+            f"🔴 Nagrywam na kanale **{vc_channel.name}**. "
             f"Zatrzymaj komendą `/skryba stop`.",
-            ephemeral=True,
+            ephemeral=False,
         )
 
     @app_commands.command(
@@ -320,22 +324,27 @@ class SkrybaGroup(app_commands.Group):
         description="Kończy nagrywanie i publikuje podsumowanie.",
     )
     async def stop(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if guild is None or guild.id not in self.bot.sessions:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Nie ma aktywnego nagrania na tym serwerze.", ephemeral=True
             )
             return
+
+        # Public defer — the progress message and subsequent edits should
+        # be visible to everyone in the channel.
+        await interaction.response.defer(ephemeral=False)
 
         session = self.bot.sessions.pop(guild.id)
         session_dir = session.session_dir
         text_channel_id = session.text_channel_id
         await session.stop()
 
+        # Public progress message so everyone in the channel can see the
+        # bot is working through transcription / summarization / posting.
         progress_msg = await interaction.followup.send(
-            "Zakończono nagrywanie. Przygotowuję transkrypcję…",
-            ephemeral=True,
+            "⏹️ Zakończono nagrywanie. Przygotowuję transkrypcję…",
+            ephemeral=False,
             wait=True,
         )
 
@@ -463,15 +472,14 @@ class SkrybaGroup(app_commands.Group):
         description="Wznawia ostatnią niedokończoną sesję na tym serwerze.",
     )
     async def kontynuuj(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if guild is None:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Komenda działa tylko na serwerze.", ephemeral=True
             )
             return
         if guild.id in self.bot.sessions:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Trwa nagrywanie — najpierw zakończ przez `/skryba stop`.",
                 ephemeral=True,
             )
@@ -493,7 +501,7 @@ class SkrybaGroup(app_commands.Group):
                     latest_state = None
                 if latest_state is not None and latest_state.stage == "failed":
                     err = latest_state.last_error or "(brak szczegółów)"
-                    await interaction.followup.send(
+                    await interaction.response.send_message(
                         f"Ostatnia sesja `{latest.name}` została oznaczona jako "
                         f"`failed` po wyczerpaniu prób (`{err[:120]}`). "
                         f"Użyj `/skryba porzuc`, żeby ją wyczyścić, "
@@ -501,11 +509,14 @@ class SkrybaGroup(app_commands.Group):
                         ephemeral=True,
                     )
                     return
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Nie znalazłem żadnej niedokończonej sesji na tym serwerze.",
                 ephemeral=True,
             )
             return
+
+        # Past validation — commit to a public response.
+        await interaction.response.defer(ephemeral=False)
 
         state = SessionState.load(session_dir)
         # Tolerate sessions whose recording never reached `recorded` (e.g.
@@ -515,9 +526,11 @@ class SkrybaGroup(app_commands.Group):
             state.advance(session_dir, "recorded")
             state = SessionState.load(session_dir)
 
+        # Public so others in the channel see the bot is picking the session
+        # back up instead of silently chewing on it.
         await interaction.followup.send(
-            f"Wznawiam sesję `{session_dir.name}` od etapu `{state.stage}`…",
-            ephemeral=True,
+            f"▶️ Wznawiam sesję `{session_dir.name}` od etapu `{state.stage}`…",
+            ephemeral=False,
         )
 
         try:
@@ -549,15 +562,14 @@ class SkrybaGroup(app_commands.Group):
         description="Porzuca ostatnią niedokończoną sesję (oznacza ją jako failed).",
     )
     async def porzuc(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if guild is None:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Komenda działa tylko na serwerze.", ephemeral=True
             )
             return
         if guild.id in self.bot.sessions:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Trwa nagrywanie — najpierw zakończ przez `/skryba stop`.",
                 ephemeral=True,
             )
@@ -566,7 +578,7 @@ class SkrybaGroup(app_commands.Group):
             self.bot.cfg.recording.output_dir, guild.id
         )
         if session_dir is None:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Nie ma niedokończonej sesji do porzucenia.", ephemeral=True
             )
             return
@@ -576,14 +588,15 @@ class SkrybaGroup(app_commands.Group):
             state.advance(session_dir, "failed")
         except Exception as e:
             log.exception("porzuc: could not mark session failed")
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 f"Nie udało się porzucić sesji: `{e}`.", ephemeral=True
             )
             return
-        await interaction.followup.send(
-            f"Sesja `{session_dir.name}` porzucona. "
+        # Public — abandoning a session is a notable state change.
+        await interaction.response.send_message(
+            f"🗑️ Sesja `{session_dir.name}` porzucona. "
             f"Pliki zostały zachowane na dysku.",
-            ephemeral=True,
+            ephemeral=False,
         )
 
     @app_commands.command(

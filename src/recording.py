@@ -76,17 +76,36 @@ def finalize_audio(session_dir: Path) -> None:
         _ffmpeg_pcm_to_wav(pcm, wav)
 
 
-def cleanup_audio_files(session_dir: Path) -> None:
-    """Delete per-user .pcm and .wav files after a successful upload."""
+def cleanup_pcm_files(session_dir: Path) -> None:
+    """Delete per-user .pcm files after a successful upload.
+
+    PCM is the recovery anchor *during* the pipeline (it lets us re-run
+    transcription from scratch if the WAV is somehow bad). Once we've
+    reached `posted`, the WAV is sufficient for re-transcription, replay,
+    and long-term archive, and is ~6× smaller than the silence-padded
+    PCM. So `posted` is when we drop PCM unconditionally."""
     audio_dir = session_dir / "audio"
     if not audio_dir.exists():
         return
-    for ext in ("*.pcm", "*.wav"):
-        for p in audio_dir.glob(ext):
-            try:
-                p.unlink()
-            except OSError:
-                pass
+    for p in audio_dir.glob("*.pcm"):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def cleanup_wav_files(session_dir: Path) -> None:
+    """Delete per-user .wav files. Only invoked when the operator
+    explicitly opts out of keeping audio long-term (`keep_audio: false`).
+    PCM is handled separately by `cleanup_pcm_files`."""
+    audio_dir = session_dir / "audio"
+    if not audio_dir.exists():
+        return
+    for p in audio_dir.glob("*.wav"):
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
 
 @dataclass

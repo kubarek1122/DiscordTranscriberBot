@@ -16,7 +16,7 @@ from tenacity import (
 from config import AppConfig
 from src.artifacts import write_actions, write_summary, write_transcript
 from src.messages import PIPELINE_FAILED
-from src.recording import cleanup_audio_files, finalize_audio
+from src.recording import cleanup_pcm_files, cleanup_wav_files, finalize_audio
 from src.session import STAGE_ORDER, SessionState, Stage  # noqa: F401
 from src.summarize import Summarizer, get_summarizer
 from src.transcribe import Transcriber, format_transcript, transcribe_session
@@ -115,8 +115,12 @@ async def run_pipeline(
         if not _stage_at_least(state, "posted"):
             await _notify("posted")
             await _post_with_retry(state, session_dir, bot, cfg)
+            # Drop the bulky silence-padded PCM unconditionally — the WAV
+            # is sufficient for any downstream re-run from here. Operators
+            # who *also* want WAVs gone set `keep_audio: false`.
+            cleanup_pcm_files(session_dir)
             if not cfg.recording.keep_audio:
-                cleanup_audio_files(session_dir)
+                cleanup_wav_files(session_dir)
     except BaseException as e:
         # Treat asyncio.CancelledError as a clean abort — don't burn a retry
         # for it. Anything else counts toward the budget.

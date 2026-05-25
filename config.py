@@ -40,7 +40,17 @@ class SummarizerConfig(BaseModel):
 
 class RecordingConfig(BaseModel):
     output_dir: Path = Path("./recordings")
-    keep_audio: bool = False
+    # Audio file lifecycle, per session:
+    #   recording → posted: per-user .pcm is always kept (recovery anchor)
+    #   posted:             .pcm is always deleted (silence-padded, bulky)
+    #   posted:             .wav is kept iff keep_audio=True (this flag)
+    #
+    # Default-on so the small (~1.9 MB/min × speakers) 16 kHz mono WAV
+    # files stick around for re-transcription / replay / archive. Set to
+    # False to also drop WAVs after a successful post — disk usage falls
+    # to zero per session, but you give up the ability to re-run the
+    # pipeline against the original audio later.
+    keep_audio: bool = True
     chunk_seconds: int = 30
     idle_timeout_s: int = 300
     heartbeat_interval_s: int = 10
