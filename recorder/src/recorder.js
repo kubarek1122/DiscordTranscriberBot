@@ -16,6 +16,22 @@ import { log } from './log.js';
 // 48 kHz × 2 channels × 2 bytes = 192 bytes per millisecond of s16le PCM.
 const BYTES_PER_MS = 192;
 
+// One decoded opus frame = 20 ms of audio (960 samples × 2 ch × 2 bytes).
+const FRAME_MS = 20;
+
+// One stereo s16 sample pair = 4 bytes. All writes (frames and padding)
+// MUST be a multiple of this or the L/R interleaving shifts and the rest
+// of the file decodes as static.
+const SAMPLE_ALIGN = 4;
+
+// Only gaps longer than this are treated as *real* silence and backfilled
+// with zeros. Anything shorter is normal 20 ms frame cadence plus network
+// jitter and event-loop delay — padding those sub-threshold wiggles slices
+// continuous speech into a buzzy stutter (the bug this constant fixes).
+// We only need coarse alignment for transcript ordering, so a generous
+// threshold is strictly better here.
+const SILENCE_GAP_MS = 200;
+
 // Reusable zero-filled buffer for filling inter-utterance silence gaps in
 // the per-user PCM streams. Discord's voice gateway only delivers RTP
 // frames while a user is actively speaking, so without this padding each
@@ -212,32 +228,37 @@ export class RecordingSession {
       // frames; check before touching it.
       if (!this.writers.has(userId)) return;
 
-      // Pad with silence so the file's byte position matches session time.
-      // The chunk represents 20 ms of audio ending at `wallMs`; we want
-      // the file to be exactly `wallMs` ms long after this chunk lands.
-      const wallMs = Date.now() - this.sessionStartMs;
-      const targetBytes = wallMs * BYTES_PER_MS;
-      const currentBytes = this.fileBytes.get(userId) || 0;
-      let padBytes = targetBytes - chunk.length - currentBytes;
-      // During active speech, frames arrive every ~20 ms and padBytes is
-      // ~0 (modulo jitter); after a silence it's the full pause length.
-      // Clamp negatives — over-arrival is harmless, we just skip padding.
-      while (padBytes > 0) {
-        const slice =
-          padBytes >= PCM_SILENCE_CHUNK.length
-            ? PCM_SILENCE_CHUNK
-            : PCM_SILENCE_CHUNK.subarray(0, padBytes);
-        const okPad = writer.write(slice);
-        this.fileBytes.set(
-          userId,
-          (this.fileBytes.get(userId) || 0) + slice.length,
-        );
-        padBytes -= slice.length;
-        if (!okPad) {
-          // Backpressure mid-pad: stop padding for now, let drain re-fire
-          // the decoder. The remaining pad will be re-computed on the
-          // next data event (which will see a still-large wallMs gap).
-          break;
+      // Backfill *genuine* silence only. `fileMs` is how much audio is
+      // already in this user's file; `nowMs` is session wall-clock. During
+      // continuous speech the two stay in lockstep (both advance ~20 ms per
+      // frame), so `gapMs` hovers near zero and we write frames back-to-back
+      // — the decoder output is already gapless. After a real pause the
+      // decoder emits nothing, so `fileMs` freezes while `nowMs` advances;
+      // the next frame sees a large `gapMs` and we pad once, in bulk.
+      const nowMs = Date.now() - this.sessionStartMs;
+      const fileBytes = this.fileBytes.get(userId) || 0;
+      const fileMs = fileBytes / BYTES_PER_MS;
+      const gapMs = nowMs - fileMs;
+      if (gapMs > SILENCE_GAP_MS) {
+        // Land this frame so it *ends* at ~nowMs: pad up to (nowMs - 20 ms),
+        // then the 20 ms frame below fills the last slot. Sample-align so we
+        // never split a stereo pair and swap L/R for the rest of the file.
+        let padBytes = Math.floor((gapMs - FRAME_MS) * BYTES_PER_MS);
+        padBytes -= padBytes % SAMPLE_ALIGN;
+        while (padBytes > 0) {
+          const n = Math.min(padBytes, PCM_SILENCE_CHUNK.length);
+          const slice =
+            n === PCM_SILENCE_CHUNK.length
+              ? PCM_SILENCE_CHUNK
+              : PCM_SILENCE_CHUNK.subarray(0, n);
+          const okPad = writer.write(slice);
+          this.fileBytes.set(userId, (this.fileBytes.get(userId) || 0) + n);
+          padBytes -= n;
+          // Backpressure mid-pad: stop here. The frame write below will see
+          // the full buffer, pause the decoder, and resume on drain; the
+          // remaining gap is recomputed on the next data event. The frame
+          // is still buffered (not lost) by that write().
+          if (!okPad) break;
         }
       }
 
