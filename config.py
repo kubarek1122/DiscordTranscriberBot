@@ -18,7 +18,7 @@ class WhisperConfig(BaseModel):
 
 class ClaudeConfig(BaseModel):
     model: str = "claude-sonnet-4-6"
-    max_tokens: int = 4096
+    max_tokens: int = 8192
 
 
 class OpenAIConfig(BaseModel):

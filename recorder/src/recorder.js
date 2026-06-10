@@ -16,21 +16,27 @@ import { log } from './log.js';
 // 48 kHz × 2 channels × 2 bytes = 192 bytes per millisecond of s16le PCM.
 const BYTES_PER_MS = 192;
 
-// One decoded opus frame = 20 ms of audio (960 samples × 2 ch × 2 bytes).
-const FRAME_MS = 20;
-
 // One stereo s16 sample pair = 4 bytes. All writes (frames and padding)
 // MUST be a multiple of this or the L/R interleaving shifts and the rest
 // of the file decodes as static.
 const SAMPLE_ALIGN = 4;
 
-// Only gaps longer than this are treated as *real* silence and backfilled
-// with zeros. Anything shorter is normal 20 ms frame cadence plus network
-// jitter and event-loop delay — padding those sub-threshold wiggles slices
-// continuous speech into a buzzy stutter (the bug this constant fixes).
-// We only need coarse alignment for transcript ordering, so a generous
-// threshold is strictly better here.
-const SILENCE_GAP_MS = 200;
+// Burst boundary. Discord delivers a user's opus frames sparsely and
+// bursty — even continuous speech can arrive as clusters of frames spaced
+// 150–250 ms apart in wall-clock (bad mics, sender-side VAD, packet loss,
+// jitter). We must NOT place each frame at its absolute wall-clock offset,
+// or those inter-frame gaps get backfilled with silence and continuous
+// speech is stretched into a choppy frame+silence stutter.
+//
+// Instead: frames arriving within BURST_GAP_MS of the previous one are
+// treated as the same utterance and written back-to-back (smooth). Only a
+// gap LARGER than this is a real pause — there we re-anchor the file to the
+// new frame's absolute session time, which (a) inserts genuine silence and
+// (b) keeps cross-speaker ordering correct at turn granularity.
+//
+// Tuning: conversational turn-taking pauses are typically well above this;
+// within-utterance delivery gaps are below it. 600 ms is a safe middle.
+const BURST_GAP_MS = 600;
 
 // Reusable zero-filled buffer for filling inter-utterance silence gaps in
 // the per-user PCM streams. Discord's voice gateway only delivers RTP
@@ -72,6 +78,14 @@ export class RecordingSession {
      * @type {Map<string, number>}
      */
     this.fileBytes = new Map();
+    /**
+     * Wall-clock time (ms since session start) of the last frame written for
+     * each user. Used to decide whether the next frame continues the current
+     * burst (concatenate, smooth) or starts a new one after a real pause
+     * (re-anchor to absolute session time). See BURST_GAP_MS.
+     * @type {Map<string, number>}
+     */
+    this.lastFrameMs = new Map();
     this.totalFrames = 0;
     this.stopped = false;
     // Captured in start() so every chunk's pad-bytes can be derived from
@@ -228,23 +242,21 @@ export class RecordingSession {
       // frames; check before touching it.
       if (!this.writers.has(userId)) return;
 
-      // Backfill *genuine* silence only. `fileMs` is how much audio is
-      // already in this user's file; `nowMs` is session wall-clock. During
-      // continuous speech the two stay in lockstep (both advance ~20 ms per
-      // frame), so `gapMs` hovers near zero and we write frames back-to-back
-      // — the decoder output is already gapless. After a real pause the
-      // decoder emits nothing, so `fileMs` freezes while `nowMs` advances;
-      // the next frame sees a large `gapMs` and we pad once, in bulk.
       const nowMs = Date.now() - this.sessionStartMs;
-      const fileBytes = this.fileBytes.get(userId) || 0;
-      const fileMs = fileBytes / BYTES_PER_MS;
-      const gapMs = nowMs - fileMs;
-      if (gapMs > SILENCE_GAP_MS) {
-        // Land this frame so it *ends* at ~nowMs: pad up to (nowMs - 20 ms),
-        // then the 20 ms frame below fills the last slot. Sample-align so we
-        // never split a stereo pair and swap L/R for the rest of the file.
-        let padBytes = Math.floor((gapMs - FRAME_MS) * BYTES_PER_MS);
-        padBytes -= padBytes % SAMPLE_ALIGN;
+      const last = this.lastFrameMs.get(userId);
+
+      // Decide whether this frame starts a NEW burst. The very first frame
+      // for a user (last === undefined), or a frame arriving more than
+      // BURST_GAP_MS after the previous one, re-anchors the file to absolute
+      // session time. Frames within a burst are written back-to-back so
+      // sparse/bursty delivery of continuous speech isn't stretched into a
+      // stutter (see BURST_GAP_MS).
+      const newBurst = last === undefined || nowMs - last > BURST_GAP_MS;
+      if (newBurst) {
+        const fileBytes = this.fileBytes.get(userId) || 0;
+        // Pad with silence so this burst begins at its true session offset.
+        let padBytes = Math.floor(nowMs * BYTES_PER_MS) - fileBytes;
+        padBytes -= padBytes % SAMPLE_ALIGN; // keep stereo pairs intact
         while (padBytes > 0) {
           const n = Math.min(padBytes, PCM_SILENCE_CHUNK.length);
           const slice =
@@ -254,13 +266,13 @@ export class RecordingSession {
           const okPad = writer.write(slice);
           this.fileBytes.set(userId, (this.fileBytes.get(userId) || 0) + n);
           padBytes -= n;
-          // Backpressure mid-pad: stop here. The frame write below will see
-          // the full buffer, pause the decoder, and resume on drain; the
-          // remaining gap is recomputed on the next data event. The frame
-          // is still buffered (not lost) by that write().
+          // Backpressure mid-pad: stop here. The frame write below pauses
+          // the decoder and resumes on drain; the frame is still buffered
+          // (not lost). The remaining pad is recomputed next data event.
           if (!okPad) break;
         }
       }
+      this.lastFrameMs.set(userId, nowMs);
 
       this.totalFrames += 1;
       this.bytesPerUser.set(userId, this.bytesPerUser.get(userId) + chunk.length);
@@ -327,6 +339,10 @@ export class RecordingSession {
     this.decoders?.delete(userId);
     this.writers.delete(userId);
     this.subscribedUsers.delete(userId);
+    // Drop lastFrameMs so the next frame after a rejoin is treated as a new
+    // burst and re-anchored to absolute session time (it would be anyway,
+    // since the gap exceeds BURST_GAP_MS — but this keeps intent explicit).
+    this.lastFrameMs.delete(userId);
     // Intentionally NOT deleting fileBytes / bytesPerUser: the file
     // still exists on disk and the next `speaking start` for this user
     // must resume padding from the current file end, not from 0.
