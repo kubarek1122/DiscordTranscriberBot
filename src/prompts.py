@@ -14,8 +14,12 @@ poniższych nagłówków, w tej kolejności:
 neutralnym tonem, w trzeciej osobie. Nie cytuj dosłownie wypowiedzi.
 
 ## Kluczowe punkty
-Lista wypunktowana (`-`) z 3–10 najważniejszymi tezami, ustaleniami lub \
+Lista wypunktowana (`-`) z najważniejszymi tezami, ustaleniami lub \
 poruszonymi tematami. Każdy punkt jednym pełnym zdaniem.
+
+## Pomysły
+Lista wypunktowana (`-`) z pomysłami, sugestiami lub propozycjami, które \
+pojawiły się w rozmowie. Każdy punkt jednym pełnym zdaniem.
 
 ## Decyzje i zadania
 Lista wypunktowana (`-`) z konkretnymi decyzjami oraz zadaniami do wykonania. \
