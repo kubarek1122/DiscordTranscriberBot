@@ -27,7 +27,9 @@ recording:
   # 16 kHz mono WAV (~1.9 MB/min × speakers). Set to false if you don't
   # want to retain anything after the summary lands.
   keep_audio: true
-  chunk_seconds: 30
+  # No-audio watchdog: if the recorder receives no decoded frames from anyone
+  # for this long, it reports a hard failure and the session is finalized on
+  # whatever PCM was captured.
   idle_timeout_s: 300
   heartbeat_interval_s: 10
   heartbeat_stale_after_s: 60
@@ -41,5 +43,6 @@ recorder:
   # Unix-socket path to the Node sidecar. Must match IPC_SOCKET in
   # docker-compose.yml and be mounted into both containers.
   socket_path: /tmp/skryba/recorder.sock
-  join_timeout_s: 15.0
+  # Keep strictly above the recorder's READY_TIMEOUT_MS (15s) + fetch overhead.
+  join_timeout_s: 30.0
   leave_timeout_s: 15.0

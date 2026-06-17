@@ -12,13 +12,15 @@ Self-hosted Discord bot that joins voice channels, transcribes Polish discussion
    docker compose up -d
    ```
 
-4. In Discord, join a voice channel, then run `/record start`. Speak. Run `/record stop`.
+4. In Discord, join a voice channel, then run `/skryba start`. Speak. Run `/skryba stop`.
 
 ## Slash commands
 
 - `/skryba start` — bot joins your voice channel and starts recording.
 - `/skryba stop` — finalize, transcribe, summarize, post the summary.
 - `/skryba status` — show current state.
+- `/skryba kontynuuj` — resume the latest unfinished session on this server.
+- `/skryba porzuc` — abandon the latest unfinished session (marks it `failed`; files kept).
 - `/skryba jaktojestbycskryba` — show quote form Asterix & Obelix
 
 ## Artifacts
@@ -33,6 +35,13 @@ For each session, `recordings/<guild_id>/<YYYY-MM-DD_HH-MM-SS>/` will contain:
 - `actions.md` — extracted "Decyzje i zadania" section
 
 ## Local (non-Docker) run
+
+> **Note:** `python bot.py` is only the gateway/pipeline half. Voice capture lives in the
+> Node recorder sidecar (`recorder/`), which the bot reaches over a **Unix-domain socket**.
+> Recording therefore requires the sidecar running and a platform with Unix sockets — i.e.
+> Linux (or WSL2). On native Windows the bot starts but `/skryba start` cannot connect to the
+> recorder, so use the Docker stack there. Running `bot.py` alone is only useful for the
+> pipeline/replay paths that don't capture audio.
 
 ```bash
 python -m venv .venv

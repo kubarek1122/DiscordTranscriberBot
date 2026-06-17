@@ -57,7 +57,11 @@ export function startIpcServer({ socketPath, handlers }) {
         }
         try {
           if (msg.op === 'join') {
-            const res = await handlers.onJoin({ ...msg, send });
+            // `isConnected` lets a long-running join detect that the Python
+            // side already gave up and closed the socket, so it can clean up
+            // instead of registering an orphaned session.
+            const isConnected = () => activeSocket === sock && sock.writable;
+            const res = await handlers.onJoin({ ...msg, send, isConnected });
             send(res);
           } else if (msg.op === 'leave') {
             const res = await handlers.onLeave({ ...msg, send });

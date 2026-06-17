@@ -67,11 +67,20 @@ class TranscriberBot(commands.Bot):
         # If DEV_GUILD_ID is set, sync to that guild for instant updates
         # (otherwise global sync, which can take up to an hour to propagate).
         dev_guild = os.environ.get("DEV_GUILD_ID")
+        dev_guild_id: int | None = None
         if dev_guild:
-            guild_obj = discord.Object(id=int(dev_guild))
+            try:
+                dev_guild_id = int(dev_guild)
+            except ValueError:
+                log.warning(
+                    "DEV_GUILD_ID=%r is not a valid integer; falling back to global sync",
+                    dev_guild,
+                )
+        if dev_guild_id is not None:
+            guild_obj = discord.Object(id=dev_guild_id)
             self.tree.copy_global_to(guild=guild_obj)
             synced = await self.tree.sync(guild=guild_obj)
-            log.info("synced %d slash command(s) to guild %s", len(synced), dev_guild)
+            log.info("synced %d slash command(s) to guild %s", len(synced), dev_guild_id)
         else:
             synced = await self.tree.sync()
             log.info("synced %d slash command(s) globally", len(synced))

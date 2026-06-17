@@ -36,7 +36,6 @@ class SessionState(BaseModel):
     members: dict[str, str] = Field(default_factory=dict)  # user_id -> display_name
     posted_message_id: int | None = None
     summarizer_backend: str | None = None
-    error: str | None = None
     # Cumulative count of top-level pipeline invocations that raised. The
     # pipeline advances to `failed` once this hits `cfg.reliability.max_pipeline_retries`.
     retries: int = 0

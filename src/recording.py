@@ -176,6 +176,7 @@ class RecordingSession:
                 voice_channel_id=self.voice_channel.id,
                 session_dir=self.session_dir,
                 timeout_s=self.cfg.recorder.join_timeout_s,
+                idle_timeout_s=self.cfg.recording.idle_timeout_s,
             )
         except RecorderError:
             await self.client.close()

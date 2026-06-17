@@ -51,7 +51,6 @@ class RecordingConfig(BaseModel):
     # to zero per session, but you give up the ability to re-run the
     # pipeline against the original audio later.
     keep_audio: bool = True
-    chunk_seconds: int = 30
     idle_timeout_s: int = 300
     heartbeat_interval_s: int = 10
     heartbeat_stale_after_s: int = 60
@@ -79,7 +78,10 @@ class ReliabilityConfig(BaseModel):
 
 class RecorderConfig(BaseModel):
     socket_path: Path = Path("/tmp/skryba/recorder.sock")
-    join_timeout_s: float = 15.0
+    # Must strictly exceed the recorder's internal Ready wait (READY_TIMEOUT_MS
+    # in recorder.js) plus guild/channel fetch overhead — otherwise Python can
+    # time out mid-join and orphan a recorder-side session.
+    join_timeout_s: float = 30.0
     leave_timeout_s: float = 15.0
 
 

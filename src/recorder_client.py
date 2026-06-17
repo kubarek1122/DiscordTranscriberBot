@@ -122,6 +122,7 @@ class RecorderClient:
         voice_channel_id: int,
         session_dir: Path,
         timeout_s: float,
+        idle_timeout_s: int,
     ) -> dict[str, Any]:
         return await self._request(
             {
@@ -129,6 +130,7 @@ class RecorderClient:
                 "guild_id": str(guild_id),
                 "voice_channel_id": str(voice_channel_id),
                 "session_dir": str(session_dir),
+                "idle_timeout_s": idle_timeout_s,
             },
             expect_op="joined",
             timeout_s=timeout_s,

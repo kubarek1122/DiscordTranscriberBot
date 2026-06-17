@@ -34,7 +34,7 @@ client.once('clientReady', () => {
 
 client.on('error', (e) => log.error('client error', e));
 
-async function onJoin({ guild_id, voice_channel_id, session_dir, send }) {
+async function onJoin({ guild_id, voice_channel_id, session_dir, idle_timeout_s, send, isConnected }) {
   if (!guild_id || !voice_channel_id || !session_dir) {
     return { op: 'error', error: 'join: missing required fields' };
   }
@@ -46,13 +46,15 @@ async function onJoin({ guild_id, voice_channel_id, session_dir, send }) {
     guildId: guild_id,
     voiceChannelId: voice_channel_id,
     sessionDir: session_dir,
+    idleTimeoutS: Number(idle_timeout_s) || 0,
     onSpeakerEvent: ({ user_id, display_name }) => {
       send({ op: 'speaker', guild_id, user_id, display_name });
     },
     onHardFailure: ({ reason }) => {
       // Tell Python the recording was cut short by something Discord-side
-      // (kicked, channel deleted, voice gateway gave up). Python decides
-      // whether to keep the PCM and run the pipeline anyway.
+      // (kicked, channel deleted, voice gateway gave up) or because the
+      // no-audio watchdog fired. Python decides whether to keep the PCM
+      // and run the pipeline anyway.
       send({ op: 'recording_failed', guild_id, reason });
     },
   });
@@ -61,6 +63,16 @@ async function onJoin({ guild_id, voice_channel_id, session_dir, send }) {
   } catch (e) {
     log.error(`join[${guild_id}] failed`, e);
     return { op: 'error', guild_id, error: e?.message || String(e) };
+  }
+  // The join can take several seconds (waiting for the voice connection to
+  // become Ready). If Python timed out and closed the socket meanwhile, the
+  // `onDisconnect` cleanup already ran before this session existed — so tear
+  // it down here instead of registering an orphan that would block every
+  // future join with "already recording".
+  if (isConnected && !isConnected()) {
+    log.warn(`join[${guild_id}]: requester disconnected during join, discarding session`);
+    try { await session.stop(); } catch { /* ignore */ }
+    return { op: 'error', guild_id, error: 'requester disconnected during join' };
   }
   sessions.set(guild_id, session);
   return { op: 'joined', guild_id };

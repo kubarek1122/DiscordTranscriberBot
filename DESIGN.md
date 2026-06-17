@@ -163,7 +163,7 @@ The user-message template wraps the transcript between `---` delimiters with a s
 
 ### Reliability
 
-- Summarizer call wrapped in exponential-backoff retry: **3 attempts**, delays 1 s / 4 s / 16 s.
+- Summarizer call wrapped in exponential-backoff retry: `reliability.summarizer_retries` attempts (default **5**), exponential delay capped at `reliability.summarizer_backoff_max_s` (default 60 s). This sits *outside* the Anthropic SDK's own `Retry-After`-honouring retries.
 - If all retries fail, the transcript is still on disk → session stays at `stage=transcribed`, the user can re-summarize later via the replay CLI (see §11).
 
 ---
@@ -214,9 +214,9 @@ Each session directory has a `session.json` written atomically (write to `.tmp`,
 3. **Heartbeat.** Update `last_heartbeat` every 10 s. On startup, a session with `stage=recording` whose `last_heartbeat` is older than 60 s is treated as crashed and advanced to `recorded`.
 4. **Startup recovery scan.** On bot ready: walk `recordings/*/*/session.json`, find any session with `stage != "posted"`, finalize audio if needed, then run the pipeline from the last completed stage. The user gets their summary even if the machine rebooted overnight.
 5. **Voice disconnect handler.** If the bot is involuntarily removed from VC mid-recording: flush in-flight PCM, mark `stage=recorded`, do **not** auto-rejoin (auto-rejoin races with users moving channels), and run the pipeline. Captured audio is safe.
-6. **Idle timeout** (config knob, default 300 s): if a session sits at `stage=recording` with no audio for this long after a disconnect, auto-finalize.
+6. **Idle timeout** (`recording.idle_timeout_s`, default 300 s, passed to the recorder at join time): the recorder watches for decoded frames from any user; if none arrive for this long it emits `recording_failed reason=idle_timeout`, which the bot handles like any hard failure — finalize the captured PCM and run the pipeline. Set to 0 to disable.
 7. **Container restart policy.** Docker `restart: unless-stopped` so power restoration → daemon up → bot up → recovery scan runs. Zero human action.
-8. **Bounded retries.** Summarizer 3×, post 5×, both exponential backoff. Failed sessions stay on disk for manual replay.
+8. **Bounded retries.** Summarizer `summarizer_retries`× (default 5), post 5×, both exponential backoff. Failed sessions stay on disk for manual replay.
 
 ---
 
@@ -236,7 +236,7 @@ recordings/
       actions.md                          # extracted "Decyzje i zadania" section
 ```
 
-`recording.keep_audio: false` (default) → delete `.pcm` and `.wav` after a successful post. Set to `true` to retain audio for re-transcription.
+`.pcm` is always deleted after a successful post (bulky, silence-padded). `.wav` is kept by default (`recording.keep_audio: true`) for re-transcription/replay; set `keep_audio: false` to also drop `.wav` after a successful post.
 
 ---
 
@@ -281,15 +281,20 @@ summarizer:
 
 recording:
   output_dir: ./recordings
-  keep_audio: false
-  chunk_seconds: 30
-  idle_timeout_s: 300
+  keep_audio: true
+  idle_timeout_s: 300       # recorder no-audio watchdog; 0 disables
   heartbeat_interval_s: 10
   heartbeat_stale_after_s: 60
 
 reliability:
-  summarizer_retries: 3
+  summarizer_retries: 5
+  summarizer_backoff_max_s: 60
   post_retries: 5
+
+recorder:
+  socket_path: /tmp/skryba/recorder.sock
+  join_timeout_s: 30.0      # must exceed the recorder's 15 s Ready wait
+  leave_timeout_s: 15.0
 ```
 
 ### `.env`

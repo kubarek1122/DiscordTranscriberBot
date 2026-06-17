@@ -16,6 +16,14 @@ import { log } from './log.js';
 // 48 kHz × 2 channels × 2 bytes = 192 bytes per millisecond of s16le PCM.
 const BYTES_PER_MS = 192;
 
+// How long to wait for the voice connection to reach Ready before declaring
+// the join failed. The Python side's `recorder.join_timeout_s` MUST stay
+// strictly above this (+ fetch overhead) or it orphans sessions on slow joins.
+const READY_TIMEOUT_MS = 15_000;
+
+// How often the no-audio watchdog checks for inactivity, in ms.
+const IDLE_CHECK_INTERVAL_MS = 10_000;
+
 // One stereo s16 sample pair = 4 bytes. All writes (frames and padding)
 // MUST be a multiple of this or the L/R interleaving shifts and the rest
 // of the file decodes as static.
@@ -48,12 +56,13 @@ const BURST_GAP_MS = 600;
 const PCM_SILENCE_CHUNK = Buffer.alloc(BYTES_PER_MS * 200);
 
 export class RecordingSession {
-  constructor({ client, guildId, voiceChannelId, sessionDir, onSpeakerEvent, onHardFailure }) {
+  constructor({ client, guildId, voiceChannelId, sessionDir, idleTimeoutS, onSpeakerEvent, onHardFailure }) {
     this.client = client;
     this.guildId = guildId;
     this.voiceChannelId = voiceChannelId;
     this.sessionDir = sessionDir;
     this.audioDir = path.join(sessionDir, 'audio');
+    this.idleTimeoutS = idleTimeoutS || 0; // 0 disables the no-audio watchdog
     this.onSpeakerEvent = onSpeakerEvent; // optional callback for IPC notifications
     this.onHardFailure = onHardFailure;   // optional callback ({reason}) on unrecoverable voice failure
     this.failureReported = false;         // dedupe: emit recording_failed at most once
@@ -94,11 +103,18 @@ export class RecordingSession {
     // session wall-clock time equal, which is what `transcribe_session`
     // assumes when sorting segments.
     this.sessionStartMs = 0;
+    // Wall-clock (ms) of the most recent decoded frame from ANY user. Drives
+    // the no-audio watchdog; initialized to session start so a session that
+    // never receives a single frame still times out.
+    this.lastAnyFrameMs = 0;
+    /** @type {NodeJS.Timeout | null} */
+    this._idleTimer = null;
   }
 
   async start() {
     fs.mkdirSync(this.audioDir, { recursive: true });
     this.sessionStartMs = Date.now();
+    this.lastAnyFrameMs = this.sessionStartMs;
     const guild = await this.client.guilds.fetch(this.guildId);
     const channel = await guild.channels.fetch(this.voiceChannelId);
     if (!channel?.isVoiceBased()) {
@@ -115,7 +131,9 @@ export class RecordingSession {
 
     // joinVoiceChannel resolves quickly; wait for the connection to be ready
     // before declaring success so the IPC ack means audio will actually flow.
-    await entersState(this.conn, VoiceConnectionStatus.Ready, 15_000);
+    await entersState(this.conn, VoiceConnectionStatus.Ready, READY_TIMEOUT_MS);
+
+    this._armIdleWatchdog();
 
     this.conn.receiver.speaking.on('start', (userId) => this._onSpeakingStart(userId));
 
@@ -242,6 +260,7 @@ export class RecordingSession {
       // frames; check before touching it.
       if (!this.writers.has(userId)) return;
 
+      this.lastAnyFrameMs = Date.now(); // feed the no-audio watchdog
       const nowMs = Date.now() - this.sessionStartMs;
       const last = this.lastFrameMs.get(userId);
 
@@ -307,6 +326,35 @@ export class RecordingSession {
     });
   }
 
+  /**
+   * Arm the no-audio watchdog: if no decoded frame arrives from ANY user for
+   * `idleTimeoutS` seconds, report a hard failure so Python finalizes the
+   * session on whatever PCM was captured. A no-op when idleTimeoutS <= 0.
+   */
+  _armIdleWatchdog() {
+    if (this.idleTimeoutS <= 0) return;
+    const idleMs = this.idleTimeoutS * 1000;
+    this._idleTimer = setInterval(() => {
+      if (this.stopped) return;
+      if (Date.now() - this.lastAnyFrameMs > idleMs) {
+        log.warn(
+          `recorder[${this.guildId}]: no audio for ${this.idleTimeoutS}s, reporting idle_timeout`,
+        );
+        this._clearIdleWatchdog();
+        this._reportHardFailure('idle_timeout');
+      }
+    }, IDLE_CHECK_INTERVAL_MS);
+    // Don't let the watchdog keep the event loop alive on its own.
+    this._idleTimer.unref?.();
+  }
+
+  _clearIdleWatchdog() {
+    if (this._idleTimer) {
+      clearInterval(this._idleTimer);
+      this._idleTimer = null;
+    }
+  }
+
   _reportHardFailure(reason) {
     if (this.failureReported || this.stopped) return;
     this.failureReported = true;
@@ -361,6 +409,7 @@ export class RecordingSession {
   async stop() {
     if (this.stopped) return this._stats();
     this.stopped = true;
+    this._clearIdleWatchdog();
 
     // Detach the long-lived client listener so finished sessions don't
     // leak references back to the discord.js Client.
