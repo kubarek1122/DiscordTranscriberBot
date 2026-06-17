@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Voice-receive sidecar for DiscordTranscriber. Joins voice channels on behalf of the Python bot, decrypts DAVE-encrypted audio, writes per-user PCM to disk.",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=20"

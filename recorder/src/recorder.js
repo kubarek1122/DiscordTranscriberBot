@@ -12,9 +12,7 @@ import {
 } from '@discordjs/voice';
 import prism from 'prism-media';
 import { log } from './log.js';
-
-// 48 kHz × 2 channels × 2 bytes = 192 bytes per millisecond of s16le PCM.
-const BYTES_PER_MS = 192;
+import { planPad, BYTES_PER_MS, SAMPLE_ALIGN } from './timeline.js';
 
 // How long to wait for the voice connection to reach Ready before declaring
 // the join failed. The Python side's `recorder.join_timeout_s` MUST stay
@@ -24,27 +22,17 @@ const READY_TIMEOUT_MS = 15_000;
 // How often the no-audio watchdog checks for inactivity, in ms.
 const IDLE_CHECK_INTERVAL_MS = 10_000;
 
-// One stereo s16 sample pair = 4 bytes. All writes (frames and padding)
-// MUST be a multiple of this or the L/R interleaving shifts and the rest
-// of the file decodes as static.
-const SAMPLE_ALIGN = 4;
-
-// Burst boundary. Discord delivers a user's opus frames sparsely and
-// bursty — even continuous speech can arrive as clusters of frames spaced
-// 150–250 ms apart in wall-clock (bad mics, sender-side VAD, packet loss,
-// jitter). We must NOT place each frame at its absolute wall-clock offset,
-// or those inter-frame gaps get backfilled with silence and continuous
-// speech is stretched into a choppy frame+silence stutter.
-//
-// Instead: frames arriving within BURST_GAP_MS of the previous one are
-// treated as the same utterance and written back-to-back (smooth). Only a
-// gap LARGER than this is a real pause — there we re-anchor the file to the
-// new frame's absolute session time, which (a) inserts genuine silence and
-// (b) keeps cross-speaker ordering correct at turn granularity.
-//
-// Tuning: conversational turn-taking pauses are typically well above this;
-// within-utterance delivery gaps are below it. 600 ms is a safe middle.
-const BURST_GAP_MS = 600;
+// Silence placement is driven by Discord's `speaking` start/end VAD events
+// (see _onSpeakingStart / _onSpeakingEnd): we pad the real gap at the start of
+// each speech burst, then write that burst's frames back-to-back. This is a
+// pure safety net for the case where Discord never emits `speaking 'end'`
+// (lenient VAD, held-open mic): a wall-clock gap between consecutive frames
+// larger than this forces a re-anchor so a genuine multi-second pause isn't
+// concatenated away. Kept generous so ordinary sparse/DTX delivery within an
+// utterance (~150–250 ms inter-frame) is NEVER mistaken for a pause — that
+// false re-anchoring is exactly what used to shred speech into a
+// 20 ms-on / 200 ms-off stutter.
+const SAFETY_RESYNC_MS = 1500;
 
 // Reusable zero-filled buffer for filling inter-utterance silence gaps in
 // the per-user PCM streams. Discord's voice gateway only delivers RTP
@@ -88,13 +76,23 @@ export class RecordingSession {
      */
     this.fileBytes = new Map();
     /**
-     * Wall-clock time (ms since session start) of the last frame written for
-     * each user. Used to decide whether the next frame continues the current
-     * burst (concatenate, smooth) or starts a new one after a real pause
-     * (re-anchor to absolute session time). See BURST_GAP_MS.
+     * Session-time (ms) of the last frame written for each user. Feeds the
+     * SAFETY_RESYNC_MS fallback in `planPad`.
      * @type {Map<string, number>}
      */
     this.lastFrameMs = new Map();
+    /**
+     * Per-user speech-burst state, driven by Discord's `speaking` events:
+     *   isSpeaking   — currently inside a Discord-detected speech period
+     *   burstAnchorMs — session-time the current burst began (its true onset)
+     *   needPad      — a burst just started; pad the real silence before its
+     *                  first decoded frame, then concatenate the rest
+     * @type {Map<string, boolean>} */
+    this.isSpeaking = new Map();
+    /** @type {Map<string, number>} */
+    this.burstAnchorMs = new Map();
+    /** @type {Map<string, boolean>} */
+    this.needPad = new Map();
     this.totalFrames = 0;
     this.stopped = false;
     // Captured in start() so every chunk's pad-bytes can be derived from
@@ -136,6 +134,7 @@ export class RecordingSession {
     this._armIdleWatchdog();
 
     this.conn.receiver.speaking.on('start', (userId) => this._onSpeakingStart(userId));
+    this.conn.receiver.speaking.on('end', (userId) => this._onSpeakingEnd(userId));
 
     // When a user leaves the recorded VC, Discord frees their SSRC. Our
     // existing opus subscription is bound to that dead SSRC, so it just
@@ -202,6 +201,20 @@ export class RecordingSession {
 
   _onSpeakingStart(userId) {
     if (this.stopped) return;
+
+    // Mark the start of a speech burst (Discord's own VAD). Runs on EVERY
+    // start — even when already subscribed — so the next decoded frame pads
+    // the real silence since the previous burst, then frames concatenate.
+    // The pad is deferred to the first frame, so a spurious start with no
+    // audio inserts nothing.
+    if (!this.isSpeaking.get(userId)) {
+      this.isSpeaking.set(userId, true);
+      this.burstAnchorMs.set(userId, Math.max(0, Date.now() - this.sessionStartMs));
+      this.needPad.set(userId, true);
+    }
+
+    // Build the opus→decoder→writer pipeline once per user (kept alive for the
+    // whole session via EndBehaviorType.Manual).
     if (this.subscribedUsers.has(userId)) return;
     this.subscribedUsers.add(userId);
 
@@ -262,34 +275,33 @@ export class RecordingSession {
 
       this.lastAnyFrameMs = Date.now(); // feed the no-audio watchdog
       const nowMs = Date.now() - this.sessionStartMs;
-      const last = this.lastFrameMs.get(userId);
 
-      // Decide whether this frame starts a NEW burst. The very first frame
-      // for a user (last === undefined), or a frame arriving more than
-      // BURST_GAP_MS after the previous one, re-anchors the file to absolute
-      // session time. Frames within a burst are written back-to-back so
-      // sparse/bursty delivery of continuous speech isn't stretched into a
-      // stutter (see BURST_GAP_MS).
-      const newBurst = last === undefined || nowMs - last > BURST_GAP_MS;
-      if (newBurst) {
-        const fileBytes = this.fileBytes.get(userId) || 0;
-        // Pad with silence so this burst begins at its true session offset.
-        let padBytes = Math.floor(nowMs * BYTES_PER_MS) - fileBytes;
-        padBytes -= padBytes % SAMPLE_ALIGN; // keep stereo pairs intact
-        while (padBytes > 0) {
-          const n = Math.min(padBytes, PCM_SILENCE_CHUNK.length);
-          const slice =
-            n === PCM_SILENCE_CHUNK.length
-              ? PCM_SILENCE_CHUNK
-              : PCM_SILENCE_CHUNK.subarray(0, n);
-          const okPad = writer.write(slice);
-          this.fileBytes.set(userId, (this.fileBytes.get(userId) || 0) + n);
-          padBytes -= n;
-          // Backpressure mid-pad: stop here. The frame write below pauses
-          // the decoder and resumes on drain; the frame is still buffered
-          // (not lost). The remaining pad is recomputed next data event.
-          if (!okPad) break;
-        }
+      // How much silence (if any) to insert before this frame so the file
+      // stays aligned to session time. Pads at burst starts and across long
+      // unmarked pauses; returns 0 for normal in-burst frames (incl. sparse
+      // DTX delivery) so continuous speech is never shredded. See planPad.
+      let padBytes = planPad({
+        nowMs,
+        fileBytes: this.fileBytes.get(userId) || 0,
+        lastFrameMs: this.lastFrameMs.get(userId),
+        needPad: this.needPad.get(userId) === true,
+        burstAnchorMs: this.burstAnchorMs.get(userId) || 0,
+        safetyMs: SAFETY_RESYNC_MS,
+      });
+      this.needPad.set(userId, false);
+      while (padBytes > 0) {
+        const n = Math.min(padBytes, PCM_SILENCE_CHUNK.length);
+        const slice =
+          n === PCM_SILENCE_CHUNK.length
+            ? PCM_SILENCE_CHUNK
+            : PCM_SILENCE_CHUNK.subarray(0, n);
+        const okPad = writer.write(slice);
+        this.fileBytes.set(userId, (this.fileBytes.get(userId) || 0) + n);
+        padBytes -= n;
+        // Backpressure mid-pad: stop here. The frame write below pauses the
+        // decoder and resumes on drain (the frame is still buffered, not
+        // lost). Any unwritten pad is reclaimed at the next burst's re-anchor.
+        if (!okPad) break;
       }
       this.lastFrameMs.set(userId, nowMs);
 
@@ -324,6 +336,13 @@ export class RecordingSession {
       );
       this._teardownUserStream(userId);
     });
+  }
+
+  _onSpeakingEnd(userId) {
+    if (this.stopped) return;
+    // Discord's VAD says this user stopped. Close the burst; the silence until
+    // the next burst is padded lazily when that burst's first frame arrives.
+    this.isSpeaking.set(userId, false);
   }
 
   /**
@@ -387,10 +406,12 @@ export class RecordingSession {
     this.decoders?.delete(userId);
     this.writers.delete(userId);
     this.subscribedUsers.delete(userId);
-    // Drop lastFrameMs so the next frame after a rejoin is treated as a new
-    // burst and re-anchored to absolute session time (it would be anyway,
-    // since the gap exceeds BURST_GAP_MS — but this keeps intent explicit).
+    // Drop per-user burst state so the next `speaking start` after a rejoin
+    // re-anchors cleanly (pads the real away-gap before its first frame).
     this.lastFrameMs.delete(userId);
+    this.isSpeaking.delete(userId);
+    this.burstAnchorMs.delete(userId);
+    this.needPad.delete(userId);
     // Intentionally NOT deleting fileBytes / bytesPerUser: the file
     // still exists on disk and the next `speaking start` for this user
     // must resume padding from the current file end, not from 0.
