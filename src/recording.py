@@ -137,6 +137,7 @@ class RecordingSession:
         voice_channel: discord.VoiceChannel,
         text_channel_id: int,
         cfg: AppConfig,
+        discussion_kind: str | None = None,
         on_hard_failure: Callable[[str], Awaitable[None]] | None = None,
     ) -> "RecordingSession":
         guild = voice_channel.guild
@@ -146,6 +147,8 @@ class RecordingSession:
             text_channel_id=text_channel_id,
         )
         state.summarizer_backend = cfg.summarizer.backend
+        # None ⇒ the pipeline auto-detects the kind at summarize time.
+        state.discussion_kind = discussion_kind
         for m in voice_channel.members:
             if not m.bot:
                 state.members[str(m.id)] = m.display_name

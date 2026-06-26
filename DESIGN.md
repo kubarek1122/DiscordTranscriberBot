@@ -134,7 +134,8 @@ The summarizer is abstracted behind a one-method interface so backends can be sw
 ```ts
 interface Summarizer {
   name: string;
-  summarize(transcript: string): Promise<string>;  // returns Polish Markdown
+  // system_prompt selects the type-aware layout (see below); returns Polish Markdown
+  summarize(transcript: string, opts: { system_prompt: string; user_template?: string }): Promise<string>;
 }
 ```
 
@@ -148,18 +149,43 @@ Three implementations:
 
 Configuration knob: `summarizer.backend: claude | openai | ollama`. Secrets only required for the selected backend.
 
-### Polish system prompt (verbatim — keep this exactly when porting)
+### Type-aware Polish system prompts
 
-The prompt is in `src/prompts.py` as `POLISH_SUMMARY_SYSTEM`. The key invariants:
+Summarization is tailored to the **discussion kind**. `src/prompts.py` holds one system
+prompt per kind in `PROMPTS` (all share a common preamble + global rules); `POLISH_SUMMARY_SYSTEM`
+is an alias for the `general` default. Kinds and their section layouts:
 
-- Output is **entirely in Polish**, Markdown formatted, with exactly these three section headers in this order:
-  1. `## Podsumowanie` — 3–6 sentences, prose, third-person, neutral tone.
-  2. `## Kluczowe punkty` — 3–10 bullet points (`-`), one full sentence each.
-  3. `## Decyzje i zadania` — bullets of decisions and tasks. If an owner or deadline is in the transcript, append in parentheses. If none, the literal placeholder `_(brak)_`.
-- Rules: don't invent facts; skip small talk; if the transcript is too short/unclear, say so in `Podsumowanie` and put `_(brak)_` in the other two sections; no other headers; no "Here is the summary:" preamble.
-- Special trigger words in the transcript: `skrybo zapisz` / `skrybo zapamiętaj` mark the preceding or following fragment as important — the model should highlight that fragment in the summary.
+| Kind (`DISCUSSION_KINDS`) | Sections (in order) |
+|---|---|
+| `general` (default) | Podsumowanie · Kluczowe punkty · Pomysły · Decyzje i zadania |
+| `organizational` | Podsumowanie · Ustalenia i decyzje · Zadania (owner/deadline) · Terminy |
+| `design` | Podsumowanie · Omawiane podejścia · Decyzje projektowe · Otwarte pytania · Zadania |
+| `brainstorm` | Podsumowanie · Pomysły · Wątki i kierunki · Decyzje i zadania |
 
-The user-message template wraps the transcript between `---` delimiters with a short instruction in Polish.
+**Kind selection (hybrid):** `/skryba start` takes an optional `typ` choice
+(Organizacyjna/Projektowa/Burza mózgów/Ogólna), stored in `session.json.discussion_kind`. If
+omitted (`null`), the pipeline auto-detects the kind at summarize time via one best-effort
+classification call (`CLASSIFY_SYSTEM`, parsed by `parse_kind`, falling back to `general` on any
+error) and persists the result. `src.summarize.resolve_kind` implements this and is shared by the
+pipeline and the replay CLI.
+
+**Drift suggestion + re-summarize:** when a type was chosen *manually*, `/skryba stop` also runs a
+classification pass (`src.summarize.suggest_drift`); if the transcript looks like a different,
+specific kind, the invoker gets an ephemeral nudge. `/skryba przelicz [typ]`
+(`src.pipeline.resummarize_and_post`) regenerates `summary.md`/`actions.md` for the latest session
+with a chosen (or re-detected) kind and posts a fresh message — clearing `posted_message_id` so the
+idempotent poster emits a new one rather than skipping.
+
+Shared invariants across every kind:
+- Output is **entirely in Polish**, Markdown, starting with `## Podsumowanie`; each kind's final
+  actionable section uses a header `src.artifacts._ACTIONS_HEADER` matches (so `actions.md` keeps
+  populating).
+- Rules: don't invent facts; skip small talk; if the transcript is too short/unclear, say so in
+  `Podsumowanie` and put `_(brak)_` elsewhere; no extra headers; no "Here is the summary:" preamble.
+- Trigger words `skrybo zapisz` / `skrybo zapamiętaj` mark a nearby fragment as important — the
+  model highlights it. (Preserved in every kind's prompt.)
+
+The user-message template wraps the transcript between `---` delimiters with a short Polish instruction.
 
 ### Reliability
 

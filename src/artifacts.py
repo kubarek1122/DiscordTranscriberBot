@@ -18,7 +18,7 @@ def write_atomic(path: Path, content: str | bytes) -> None:
 
 
 _ACTIONS_HEADER = re.compile(
-    r"^#{1,6}\s*(?:Decyzje\s+i\s+zadania|Decyzje|Zadania|Action\s*items?)\s*$",
+    r"^#{1,6}\s*(?:Decyzje\s+i\s+zadania|Następne\s+kroki|Decyzje|Zadania|Action\s*items?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _ANY_HEADER = re.compile(r"^#{1,6}\s+\S", re.MULTILINE)

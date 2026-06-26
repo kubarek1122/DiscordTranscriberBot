@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from anthropic import AsyncAnthropic
 
-from src.prompts import POLISH_SUMMARY_SYSTEM, USER_TEMPLATE
+from src.prompts import USER_TEMPLATE
 
 
 class ClaudeSummarizer:
@@ -17,21 +17,27 @@ class ClaudeSummarizer:
         self._model = model
         self._max_tokens = max_tokens
 
-    async def summarize(self, transcript: str) -> str:
+    async def summarize(
+        self,
+        transcript: str,
+        *,
+        system_prompt: str,
+        user_template: str = USER_TEMPLATE,
+    ) -> str:
         resp = await self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
             system=[
                 {
                     "type": "text",
-                    "text": POLISH_SUMMARY_SYSTEM,
+                    "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
             messages=[
                 {
                     "role": "user",
-                    "content": USER_TEMPLATE.format(transcript=transcript),
+                    "content": user_template.format(transcript=transcript),
                 }
             ],
         )

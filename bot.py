@@ -14,7 +14,9 @@ from discord.ext import commands
 from config import AppConfig, load_config
 from src.logging_util import session_log
 from src.messages import RECORDING_CUT_SHORT, SKRYBA
-from src.pipeline import notify_pipeline_failure, run_pipeline
+from src.prompts import KIND_LABELS_PL
+from src.summarize import get_summarizer, suggest_drift
+from src.pipeline import notify_pipeline_failure, resummarize_and_post, run_pipeline
 from src.recording import RecordingSession, ensure_ffmpeg, finalize_audio
 from src.session import (
     SessionState,
@@ -256,6 +258,14 @@ def _user_voice_channel(
     return ch if isinstance(ch, discord.VoiceChannel) else None
 
 
+# Slash-command choices for the discussion type. Omitting the option leaves
+# the kind unset so the pipeline auto-detects it from the transcript.
+_KIND_CHOICES = [
+    app_commands.Choice(name=KIND_LABELS_PL[k], value=k)
+    for k in ("organizational", "design", "brainstorm", "general")
+]
+
+
 class SkrybaGroup(app_commands.Group):
     def __init__(self, bot: TranscriberBot) -> None:
         super().__init__(name="skryba", description="Sterowanie nagrywaniem rozmów")
@@ -265,7 +275,15 @@ class SkrybaGroup(app_commands.Group):
         name="start",
         description="Dołącza do twojego kanału głosowego i zaczyna nagrywać.",
     )
-    async def start(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        typ="Typ rozmowy (pomiń, aby wykryć automatycznie po nagraniu)."
+    )
+    @app_commands.choices(typ=_KIND_CHOICES)
+    async def start(
+        self,
+        interaction: discord.Interaction,
+        typ: Optional[app_commands.Choice[str]] = None,
+    ) -> None:
         # Validate BEFORE deferring so error responses are cleanly ephemeral
         # (no public "Bot is thinking…" left hanging over a user mistake).
         guild = interaction.guild
@@ -305,6 +323,7 @@ class SkrybaGroup(app_commands.Group):
             voice_channel=vc_channel,
             text_channel_id=interaction.channel_id,
             cfg=self.bot.cfg,
+            discussion_kind=typ.value if typ else None,
             on_hard_failure=_on_hard_failure,
         )
         try:
@@ -321,9 +340,10 @@ class SkrybaGroup(app_commands.Group):
             return
 
         self.bot.sessions[guild.id] = session
+        typ_label = KIND_LABELS_PL[typ.value] if typ else "automatyczny"
         # Public so the whole channel sees recording has started.
         await interaction.followup.send(
-            f"🔴 Nagrywam na kanale **{vc_channel.name}**. "
+            f"🔴 Nagrywam na kanale **{vc_channel.name}** (typ: {typ_label}). "
             f"Zatrzymaj komendą `/skryba stop`.",
             ephemeral=False,
         )
@@ -347,6 +367,9 @@ class SkrybaGroup(app_commands.Group):
         session = self.bot.sessions.pop(guild.id)
         session_dir = session.session_dir
         text_channel_id = session.text_channel_id
+        # Captured before the pipeline overwrites it: non-None only when the
+        # user explicitly chose a type at /skryba start. Drives the drift check.
+        manual_kind = session.state.discussion_kind
         await session.stop()
 
         # Public progress message so everyone in the channel can see the
@@ -390,6 +413,12 @@ class SkrybaGroup(app_commands.Group):
                     await progress_msg.edit(content="Gotowe! Podsumowanie opublikowane.")
                 except Exception:
                     pass
+            # If the user picked a type but the conversation drifted, suggest a
+            # better fit (ephemeral, best-effort — never disturb the summary).
+            if manual_kind is not None:
+                await self._maybe_suggest_drift(
+                    interaction, session_dir, manual_kind
+                )
         except Exception as e:
             log.exception("pipeline failed for session %s", session_dir)
             # Tell both the invoker (ephemeral, may not be seen) and the
@@ -412,6 +441,95 @@ class SkrybaGroup(app_commands.Group):
         finally:
             session.release_log()
 
+    async def _maybe_suggest_drift(
+        self,
+        interaction: discord.Interaction,
+        session_dir,
+        manual_kind: str,
+    ) -> None:
+        """Best-effort: if the conversation drifted from the manually-chosen
+        type, send the invoker an ephemeral nudge to re-run with the detected
+        type. Never raises into the stop flow."""
+        try:
+            transcript_path = session_dir / "transcript.txt"
+            transcript = (
+                transcript_path.read_text(encoding="utf-8")
+                if transcript_path.exists()
+                else ""
+            )
+            if not transcript.strip():
+                return
+            summarizer = get_summarizer(self.bot.cfg)
+            suggested = await suggest_drift(summarizer, transcript, manual_kind)
+            if suggested is None:
+                return
+            chosen_label = KIND_LABELS_PL.get(manual_kind, manual_kind)
+            suggested_label = KIND_LABELS_PL.get(suggested, suggested)
+            await interaction.followup.send(
+                f"💡 Oznaczono nagranie jako **{chosen_label}**, ale rozmowa "
+                f"wygląda raczej na **{suggested_label}**. Aby przeliczyć "
+                f"podsumowanie: `/skryba przelicz typ:{suggested_label}`.",
+                ephemeral=True,
+            )
+        except Exception:
+            log.exception("drift suggestion failed (ignored)")
+
+    @app_commands.command(
+        name="przelicz",
+        description="Przelicza podsumowanie ostatniej sesji (opcjonalnie z innym typem).",
+    )
+    @app_commands.describe(
+        typ="Typ rozmowy do użycia (pomiń, aby wykryć automatycznie)."
+    )
+    @app_commands.choices(typ=_KIND_CHOICES)
+    async def przelicz(
+        self,
+        interaction: discord.Interaction,
+        typ: Optional[app_commands.Choice[str]] = None,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Komenda działa tylko na serwerze.", ephemeral=True
+            )
+            return
+        if guild.id in self.bot.sessions:
+            await interaction.response.send_message(
+                "Trwa nagrywanie — najpierw zakończ przez `/skryba stop`.",
+                ephemeral=True,
+            )
+            return
+        session_dir = latest_for_guild(self.bot.cfg.recording.output_dir, guild.id)
+        if session_dir is None:
+            await interaction.response.send_message(
+                "Brak zapisanych sesji do przeliczenia.", ephemeral=True
+            )
+            return
+
+        # Ephemeral — the recalculated summary itself is posted publicly by the
+        # pipeline; the command's own chatter stays with the invoker.
+        await interaction.response.defer(ephemeral=True)
+        try:
+            with session_log(session_dir):
+                kind = await resummarize_and_post(
+                    session_dir=session_dir,
+                    cfg=self.bot.cfg,
+                    bot=self.bot,
+                    kind=typ.value if typ else None,
+                )
+        except Exception as e:
+            log.exception("przelicz failed for %s", session_dir)
+            await interaction.followup.send(
+                f"Nie udało się przeliczyć sesji `{session_dir.name}`: `{e}`.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"♻️ Przeliczono `{session_dir.name}` jako "
+            f"**{KIND_LABELS_PL.get(kind, kind)}** i opublikowano nowe podsumowanie.",
+            ephemeral=True,
+        )
+
     @app_commands.command(
         name="status",
         description="Pokazuje stan nagrywania.",
@@ -430,9 +548,11 @@ class SkrybaGroup(app_commands.Group):
             m, s = divmod(elapsed_s, 60)
             h, m = divmod(m, 60)
             members = ", ".join(session.state.members.values()) or "(brak)"
+            kind = session.state.discussion_kind
+            typ_label = KIND_LABELS_PL.get(kind, "automatyczny") if kind else "automatyczny"
             await interaction.response.send_message(
                 f"Nagrywam od {started.isoformat(timespec='seconds')} "
-                f"(czas: {h:02d}:{m:02d}:{s:02d}). Mówcy: {members}.",
+                f"(czas: {h:02d}:{m:02d}:{s:02d}). Typ: {typ_label}. Mówcy: {members}.",
                 ephemeral=True,
             )
             return
