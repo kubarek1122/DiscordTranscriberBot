@@ -323,7 +323,7 @@ DEV_GUILD_ID=...         # optional: sync slash commands to one guild for instan
 
 ### Node.js port specifics
 
-- Replace `nvidia/cuda:...` base with `nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04` + Node 20 (apt install via NodeSource), or use `node:20-bookworm` if you call out to a Python sidecar for Whisper.
+- Replace `nvidia/cuda:...` base with `nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04` + Node 22 (apt install via NodeSource), or use `node:22-bookworm` if you call out to a Python sidecar for Whisper. Node 22.12+ is required by `@discordjs/voice` ≥ 0.19.
 - The `libopus0` system package is still required for the JS decoder (`@discordjs/opus` / `opusscript`).
 - `prism-media` is the standard npm choice for decoding Opus → PCM stream-wise.
 
