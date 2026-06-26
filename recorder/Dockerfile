@@ -19,8 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --omit=dev
+# Reproducible install: package-lock.json pins the whole tree and `npm ci`
+# fails if it drifts from package.json (so the lock must be regenerated when
+# deps change). Native modules (opus/davey) still build via the apt deps above.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY src ./src
 
