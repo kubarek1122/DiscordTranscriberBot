@@ -7,9 +7,10 @@ from pathlib import Path
 
 from config import load_config
 from src.artifacts import write_actions, write_summary, write_transcript
+from src.prompts import resolve_prompt
 from src.recording import finalize_audio
 from src.session import STAGE_ORDER, SessionState
-from src.summarize import get_summarizer
+from src.summarize import get_summarizer, resolve_kind
 from src.transcribe import Transcriber, format_transcript, transcribe_session
 
 log = logging.getLogger(__name__)
@@ -55,9 +56,17 @@ async def replay(session_dir: Path, from_stage: str, repost: bool) -> None:
     if STAGE_ORDER.index(state.stage) < STAGE_ORDER.index("summarized"):
         summarizer = get_summarizer(cfg)
         transcript = (session_dir / "transcript.txt").read_text(encoding="utf-8")
-        summary_md = await summarizer.summarize(transcript) if transcript.strip() else (
-            "## Podsumowanie\n_(brak)_\n\n## Kluczowe punkty\n_(brak)_\n\n## Decyzje i zadania\n_(brak)_\n"
-        )
+        if transcript.strip():
+            kind = await resolve_kind(summarizer, transcript, state)
+            state.discussion_kind = kind
+            log.info("replay: discussion_kind=%s", kind)
+            summary_md = await summarizer.summarize(
+                transcript, system_prompt=resolve_prompt(kind)
+            )
+        else:
+            summary_md = (
+                "## Podsumowanie\n_(brak)_\n\n## Kluczowe punkty\n_(brak)_\n\n## Decyzje i zadania\n_(brak)_\n"
+            )
         write_summary(session_dir, summary_md)
         write_actions(session_dir, summary_md)
         state.summarizer_backend = summarizer.name

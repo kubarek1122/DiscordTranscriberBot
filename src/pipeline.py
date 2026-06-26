@@ -16,9 +16,10 @@ from tenacity import (
 from config import AppConfig
 from src.artifacts import write_actions, write_summary, write_transcript
 from src.messages import PIPELINE_FAILED
+from src.prompts import resolve_prompt
 from src.recording import cleanup_pcm_files, cleanup_wav_files, finalize_audio
 from src.session import STAGE_ORDER, SessionState, Stage  # noqa: F401
-from src.summarize import Summarizer, get_summarizer
+from src.summarize import Summarizer, get_summarizer, resolve_kind
 from src.transcribe import Transcriber, format_transcript, transcribe_session
 
 log = logging.getLogger(__name__)
@@ -105,7 +106,15 @@ async def run_pipeline(
                     "## Decyzje i zadania\n_(brak)_\n"
                 )
             else:
-                summary_md = await _summarize_with_retry(summarizer, transcript, cfg)
+                kind = await resolve_kind(summarizer, transcript, state)
+                state.discussion_kind = kind
+                state.save(session_dir)  # durable before the (retried) summarize
+                log.info(
+                    "pipeline: session=%s discussion_kind=%s", session_dir.name, kind
+                )
+                summary_md = await _summarize_with_retry(
+                    summarizer, transcript, cfg, resolve_prompt(kind)
+                )
             write_summary(session_dir, summary_md)
             write_actions(session_dir, summary_md)
             state.summarizer_backend = summarizer.name if summarizer else state.summarizer_backend
@@ -144,7 +153,7 @@ async def run_pipeline(
 
 
 async def _summarize_with_retry(
-    summarizer: Summarizer, transcript: str, cfg: AppConfig
+    summarizer: Summarizer, transcript: str, cfg: AppConfig, system_prompt: str
 ) -> str:
     async for attempt in AsyncRetrying(
         stop=stop_after_attempt(cfg.reliability.summarizer_retries),
@@ -154,7 +163,7 @@ async def _summarize_with_retry(
         reraise=True,
     ):
         with attempt:
-            return await summarizer.summarize(transcript)
+            return await summarizer.summarize(transcript, system_prompt=system_prompt)
     raise RuntimeError("unreachable")
 
 

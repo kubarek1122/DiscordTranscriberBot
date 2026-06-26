@@ -16,7 +16,7 @@ Self-hosted Discord bot that joins voice channels, transcribes Polish discussion
 
 ## Slash commands
 
-- `/skryba start` — bot joins your voice channel and starts recording.
+- `/skryba start` — bot joins your voice channel and starts recording. Optional `typ:` chooses the discussion type (Organizacyjna / Projektowa / Burza mózgów / Ogólna) for a tailored summary; omit it to auto-detect.
 - `/skryba stop` — finalize, transcribe, summarize, post the summary.
 - `/skryba status` — show current state.
 - `/skryba kontynuuj` — resume the latest unfinished session on this server.

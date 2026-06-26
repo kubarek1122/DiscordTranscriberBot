@@ -14,6 +14,7 @@ from discord.ext import commands
 from config import AppConfig, load_config
 from src.logging_util import session_log
 from src.messages import RECORDING_CUT_SHORT, SKRYBA
+from src.prompts import KIND_LABELS_PL
 from src.pipeline import notify_pipeline_failure, run_pipeline
 from src.recording import RecordingSession, ensure_ffmpeg, finalize_audio
 from src.session import (
@@ -256,6 +257,14 @@ def _user_voice_channel(
     return ch if isinstance(ch, discord.VoiceChannel) else None
 
 
+# Slash-command choices for the discussion type. Omitting the option leaves
+# the kind unset so the pipeline auto-detects it from the transcript.
+_KIND_CHOICES = [
+    app_commands.Choice(name=KIND_LABELS_PL[k], value=k)
+    for k in ("organizational", "design", "brainstorm", "general")
+]
+
+
 class SkrybaGroup(app_commands.Group):
     def __init__(self, bot: TranscriberBot) -> None:
         super().__init__(name="skryba", description="Sterowanie nagrywaniem rozmów")
@@ -265,7 +274,15 @@ class SkrybaGroup(app_commands.Group):
         name="start",
         description="Dołącza do twojego kanału głosowego i zaczyna nagrywać.",
     )
-    async def start(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        typ="Typ rozmowy (pomiń, aby wykryć automatycznie po nagraniu)."
+    )
+    @app_commands.choices(typ=_KIND_CHOICES)
+    async def start(
+        self,
+        interaction: discord.Interaction,
+        typ: Optional[app_commands.Choice[str]] = None,
+    ) -> None:
         # Validate BEFORE deferring so error responses are cleanly ephemeral
         # (no public "Bot is thinking…" left hanging over a user mistake).
         guild = interaction.guild
@@ -305,6 +322,7 @@ class SkrybaGroup(app_commands.Group):
             voice_channel=vc_channel,
             text_channel_id=interaction.channel_id,
             cfg=self.bot.cfg,
+            discussion_kind=typ.value if typ else None,
             on_hard_failure=_on_hard_failure,
         )
         try:
@@ -321,9 +339,10 @@ class SkrybaGroup(app_commands.Group):
             return
 
         self.bot.sessions[guild.id] = session
+        typ_label = KIND_LABELS_PL[typ.value] if typ else "automatyczny"
         # Public so the whole channel sees recording has started.
         await interaction.followup.send(
-            f"🔴 Nagrywam na kanale **{vc_channel.name}**. "
+            f"🔴 Nagrywam na kanale **{vc_channel.name}** (typ: {typ_label}). "
             f"Zatrzymaj komendą `/skryba stop`.",
             ephemeral=False,
         )
@@ -430,9 +449,11 @@ class SkrybaGroup(app_commands.Group):
             m, s = divmod(elapsed_s, 60)
             h, m = divmod(m, 60)
             members = ", ".join(session.state.members.values()) or "(brak)"
+            kind = session.state.discussion_kind
+            typ_label = KIND_LABELS_PL.get(kind, "automatyczny") if kind else "automatyczny"
             await interaction.response.send_message(
                 f"Nagrywam od {started.isoformat(timespec='seconds')} "
-                f"(czas: {h:02d}:{m:02d}:{s:02d}). Mówcy: {members}.",
+                f"(czas: {h:02d}:{m:02d}:{s:02d}). Typ: {typ_label}. Mówcy: {members}.",
                 ephemeral=True,
             )
             return

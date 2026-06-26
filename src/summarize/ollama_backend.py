@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ollama import AsyncClient
 
-from src.prompts import POLISH_SUMMARY_SYSTEM, USER_TEMPLATE
+from src.prompts import USER_TEMPLATE
 
 
 class OllamaSummarizer:
@@ -12,12 +12,18 @@ class OllamaSummarizer:
         self._client = AsyncClient(host=host)
         self._model = model
 
-    async def summarize(self, transcript: str) -> str:
+    async def summarize(
+        self,
+        transcript: str,
+        *,
+        system_prompt: str,
+        user_template: str = USER_TEMPLATE,
+    ) -> str:
         resp = await self._client.chat(
             model=self._model,
             messages=[
-                {"role": "system", "content": POLISH_SUMMARY_SYSTEM},
-                {"role": "user", "content": USER_TEMPLATE.format(transcript=transcript)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_template.format(transcript=transcript)},
             ],
             options={"temperature": 0.2},
         )
