@@ -169,6 +169,13 @@ classification call (`CLASSIFY_SYSTEM`, parsed by `parse_kind`, falling back to 
 error) and persists the result. `src.summarize.resolve_kind` implements this and is shared by the
 pipeline and the replay CLI.
 
+**Drift suggestion + re-summarize:** when a type was chosen *manually*, `/skryba stop` also runs a
+classification pass (`src.summarize.suggest_drift`); if the transcript looks like a different,
+specific kind, the invoker gets an ephemeral nudge. `/skryba przelicz [typ]`
+(`src.pipeline.resummarize_and_post`) regenerates `summary.md`/`actions.md` for the latest session
+with a chosen (or re-detected) kind and posts a fresh message — clearing `posted_message_id` so the
+idempotent poster emits a new one rather than skipping.
+
 Shared invariants across every kind:
 - Output is **entirely in Polish**, Markdown, starting with `## Podsumowanie`; each kind's final
   actionable section uses a header `src.artifacts._ACTIONS_HEADER` matches (so `actions.md` keeps
