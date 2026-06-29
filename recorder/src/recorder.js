@@ -12,7 +12,8 @@ import {
 } from '@discordjs/voice';
 import prism from 'prism-media';
 import { log } from './log.js';
-import { planPad, BYTES_PER_MS, SAMPLE_ALIGN } from './timeline.js';
+import { planPad } from './timeline.js';
+import { UserPcmWriter, SILENCE_CHUNK_BYTES } from './pump.js';
 
 // How long to wait for the voice connection to reach Ready before declaring
 // the join failed. The Python side's `recorder.join_timeout_s` MUST stay
@@ -35,13 +36,12 @@ const IDLE_CHECK_INTERVAL_MS = 10_000;
 const SAFETY_RESYNC_MS = 1500;
 
 // Reusable zero-filled buffer for filling inter-utterance silence gaps in
-// the per-user PCM streams. Discord's voice gateway only delivers RTP
-// frames while a user is actively speaking, so without this padding each
-// .pcm file would be a concatenation of speech bursts with no
-// representation of the silence between them — destroying session
-// timing. 200 ms keeps the buffer small enough that backpressure can kick
-// in mid-pad on a long silence; for short tails we `.subarray()`.
-const PCM_SILENCE_CHUNK = Buffer.alloc(BYTES_PER_MS * 200);
+// the per-user PCM streams. Discord's voice gateway only delivers RTP frames
+// while a user is actively speaking, so without this padding each .pcm file
+// would be a concatenation of speech bursts with no representation of the
+// silence between them — destroying session timing. Shared read-only across
+// all per-user writers; `UserPcmWriter` `.subarray()`s it for short tails.
+const PCM_SILENCE_CHUNK = Buffer.alloc(SILENCE_CHUNK_BYTES);
 
 export class RecordingSession {
   constructor({ client, guildId, voiceChannelId, sessionDir, idleTimeoutS, onSpeakerEvent, onHardFailure }) {
@@ -93,6 +93,15 @@ export class RecordingSession {
     this.burstAnchorMs = new Map();
     /** @type {Map<string, boolean>} */
     this.needPad = new Map();
+    /**
+     * Per-user backpressure-correct PCM writer. Owns the silence-debt + frame
+     * queue and drains it across `drain` events so a multi-second gap (tens of
+     * MB of padding) is materialized in full instead of being dropped on the
+     * first backpressure signal — the regression that compressed the timeline
+     * and fused every speaker's audio at t=0. One per opus subscription.
+     * @type {Map<string, UserPcmWriter>}
+     */
+    this.pumps = new Map();
     this.totalFrames = 0;
     this.stopped = false;
     // Captured in start() so every chunk's pad-bytes can be derived from
@@ -250,6 +259,20 @@ export class RecordingSession {
     this.opusStreams.set(userId, opusStream);
     this.decoders.set(userId, decoder);
 
+    // Backpressure-correct sink: pads silence then writes the frame, pausing
+    // this decoder while the OS write buffer drains so no padding is dropped.
+    this.pumps.set(
+      userId,
+      new UserPcmWriter({
+        writer,
+        source: decoder,
+        silence: PCM_SILENCE_CHUNK,
+        onBytes: (n) =>
+          this.fileBytes.set(userId, (this.fileBytes.get(userId) || 0) + n),
+        isStopped: () => this.stopped,
+      }),
+    );
+
     const offsetMs = Math.max(0, Date.now() - this.sessionStartMs);
     log.info(
       `recorder[${this.guildId}]: first frame from ${userId} (+${offsetMs}ms) -> ${pcmPath}`,
@@ -280,7 +303,7 @@ export class RecordingSession {
       // stays aligned to session time. Pads at burst starts and across long
       // unmarked pauses; returns 0 for normal in-burst frames (incl. sparse
       // DTX delivery) so continuous speech is never shredded. See planPad.
-      let padBytes = planPad({
+      const padBytes = planPad({
         nowMs,
         fileBytes: this.fileBytes.get(userId) || 0,
         lastFrameMs: this.lastFrameMs.get(userId),
@@ -289,40 +312,17 @@ export class RecordingSession {
         safetyMs: SAFETY_RESYNC_MS,
       });
       this.needPad.set(userId, false);
-      while (padBytes > 0) {
-        const n = Math.min(padBytes, PCM_SILENCE_CHUNK.length);
-        const slice =
-          n === PCM_SILENCE_CHUNK.length
-            ? PCM_SILENCE_CHUNK
-            : PCM_SILENCE_CHUNK.subarray(0, n);
-        const okPad = writer.write(slice);
-        this.fileBytes.set(userId, (this.fileBytes.get(userId) || 0) + n);
-        padBytes -= n;
-        // Backpressure mid-pad: stop here. The frame write below pauses the
-        // decoder and resumes on drain (the frame is still buffered, not
-        // lost). Any unwritten pad is reclaimed at the next burst's re-anchor.
-        if (!okPad) break;
-      }
       this.lastFrameMs.set(userId, nowMs);
 
       this.totalFrames += 1;
       this.bytesPerUser.set(userId, this.bytesPerUser.get(userId) + chunk.length);
-      const ok = writer.write(chunk);
-      this.fileBytes.set(
-        userId,
-        (this.fileBytes.get(userId) || 0) + chunk.length,
-      );
-      if (!ok) {
-        // Disk pressure or slow fs — pause the decoder so PCM doesn't pile
-        // up in the Node heap until OOM. Resume once the OS write buffer
-        // has drained.
-        decoder.pause();
-        writer.once('drain', () => {
-          if (!this.stopped && this.decoders.get(userId) === decoder) {
-            decoder.resume();
-          }
-        });
-      }
+
+      // Hand the silence + frame to the per-user writer, which materializes
+      // the padding *before* the frame and honors backpressure across `drain`
+      // events — so a long gap is written in full instead of being truncated
+      // to one chunk like the old in-line loop, which slid every speaker's
+      // audio toward t=0 and shrank a 50-minute session to ~18 minutes.
+      this.pumps.get(userId)?.enqueue(padBytes, chunk);
     });
     decoder.on('error', (e) => {
       log.warn(
@@ -412,6 +412,11 @@ export class RecordingSession {
     this.isSpeaking.delete(userId);
     this.burstAnchorMs.delete(userId);
     this.needPad.delete(userId);
+    // Dispose the writer so a late 'drain' can't write to the closed stream;
+    // the file end (fileBytes) is accurate for what actually landed, so the
+    // next burst's planPad re-fills the gap from there.
+    this.pumps.get(userId)?.dispose();
+    this.pumps.delete(userId);
     // Intentionally NOT deleting fileBytes / bytesPerUser: the file
     // still exists on disk and the next `speaking start` for this user
     // must resume padding from the current file end, not from 0.
